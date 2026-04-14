@@ -12,6 +12,7 @@ license = "MIT"
 dependencies = [
     "anthropic>=0.40.0",
     "httpx>=0.27.0",
+    "Pillow>=10.0.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
 ]
@@ -29,6 +30,7 @@ packages = ["src/readwater"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["integration: requires API keys and network access"]
 
 [tool.ruff]
 target-version = "py311"

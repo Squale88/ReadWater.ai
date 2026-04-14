@@ -1,15 +1,34 @@
-"""Claude API integration for satellite image analysis."""
+"""Claude vision API integration for satellite image analysis.
+
+Prompts are loaded from the prompts/ directory at the project root.
+Responses use chain-of-thought: Claude reasons freely, then provides
+a JSON block that we extract.
+"""
 
 from __future__ import annotations
 
 import base64
+import json
 import os
+import re
+from pathlib import Path
 
 import anthropic
 
-from readwater.models.cell import CellAnalysis, CellScore
+MODEL = "claude-opus-4-20250514"
+MAX_TOKENS = 8192
 
-MODEL = "claude-sonnet-4-20250514"
+# Locate prompts directory relative to project root
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+PROMPTS_DIR = _PROJECT_ROOT / "prompts"
+
+
+def _load_prompt(filename: str) -> str:
+    """Load a prompt text file from the prompts/ directory."""
+    path = PROMPTS_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    return path.read_text(encoding="utf-8").strip()
 
 
 def _get_client() -> anthropic.AsyncAnthropic:
@@ -19,73 +38,69 @@ def _get_client() -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(api_key=api_key)
 
 
-def _build_analysis_prompt(parent_context: str, sections: int) -> str:
-    """Build the prompt that instructs Claude to analyze a satellite image."""
-    grid_label = f"{sections}x{sections}"
-    total = sections * sections
+def _extract_json_from_response(text: str) -> dict:
+    """Extract the last JSON block from a chain-of-thought response.
 
-    context_block = ""
-    if parent_context:
-        context_block = (
-            f"\n\nParent cell context (the broader area this cell sits within):\n"
-            f"{parent_context}\n"
-        )
+    Claude reasons freely, then includes a ```json ... ``` block.
+    We find and parse that block.
+    """
+    # Find the last ```json ... ``` block
+    matches = list(re.finditer(r"```json\s*\n(.*?)```", text, re.DOTALL))
+    if matches:
+        return json.loads(matches[-1].group(1).strip())
 
-    return f"""You are analyzing a satellite image of an inshore saltwater coastal area
-for fishing potential. Your goal is to identify fishable structure and rate each
-section of the image.{context_block}
+    # Fallback: try the last ``` ... ``` block
+    matches = list(re.finditer(r"```\s*\n(.*?)```", text, re.DOTALL))
+    if matches:
+        return json.loads(matches[-1].group(1).strip())
 
-Divide this image into a {grid_label} grid ({total} cells). Row 0 is the top,
-column 0 is the left.
-
-For each cell, provide:
-- A score from 0 to 10 for inshore fishing potential:
-  0 = open ocean, developed land, or completely inaccessible
-  3 = some water but no visible structure
-  5 = moderate structure (depth changes, shoreline features)
-  7 = good structure (grass flats, oyster bars, channels)
-  10 = prime structure (convergence of multiple features, current seams, etc.)
-- A brief summary of what you observe
-
-Also identify any fishable structure types you see across the entire image:
-grass flats, oyster bars, channels, mangrove shorelines, sand holes,
-depth transitions, current seams, dock/bridge structure, etc.
-
-Respond with valid JSON matching this schema:
-{{
-  "overall_summary": "string — high-level description of the area",
-  "sub_scores": [
-    {{"row": int, "col": int, "score": float, "summary": "string"}}
-  ],
-  "structure_types": ["string"]
-}}"""
+    # Last resort: try parsing the whole thing as JSON
+    return json.loads(text.strip())
 
 
-async def analyze_image_with_claude(
-    image_data: bytes,
-    parent_context: str = "",
-    sections: int = 3,
-    sub_cell_centers: list[tuple[float, float]] | None = None,
-) -> CellAnalysis:
-    """Send a satellite image to Claude for fishing potential analysis.
+def _cell_number_to_row_col(cell_number: int, sections: int = 4) -> tuple[int, int]:
+    """Convert 1-based cell number to (row, col). Cell 1=(0,0), Cell 16=(3,3)."""
+    return ((cell_number - 1) // sections, (cell_number - 1) % sections)
 
-    Args:
-        image_data: Raw PNG image bytes.
-        parent_context: Summary from the parent cell for geographic continuity.
-        sections: Grid divisions per side (3 = 3x3 grid).
-        sub_cell_centers: Pre-computed (lat, lon) centers for each sub-cell,
-            ordered row-major. If None, centers won't be populated in scores.
 
-    Returns:
-        CellAnalysis with scores and summaries for each sub-cell.
+async def analyze_grid_image(
+    image_path: str,
+    parent_context: str,
+    current_zoom: int,
+    center: tuple[float, float],
+    coverage_miles: float,
+) -> dict:
+    """Send a grid-overlay satellite image to Claude for cell-by-cell scoring.
+
+    Uses chain-of-thought: Claude reasons through each cell, then provides
+    a JSON block with scores. Returns a dict with:
+    - raw_response: str — Claude's full reasoning text
+    - summary, sub_scores, hydrology_notes — parsed from the JSON block
     """
     client = _get_client()
-    prompt = _build_analysis_prompt(parent_context, sections)
-    image_b64 = base64.b64encode(image_data).decode("utf-8")
+
+    with open(image_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    system_prompt = _load_prompt("grid_scoring_system.txt")
+
+    context_line = ""
+    if parent_context:
+        context_line = f"\nParent cell context:\n{parent_context}\n"
+
+    user_template = _load_prompt("grid_scoring_user.txt")
+    user_prompt = user_template.format(
+        parent_context=context_line,
+        current_zoom=current_zoom,
+        center_lat=f"{center[0]:.4f}",
+        center_lon=f"{center[1]:.4f}",
+        coverage_miles=f"{coverage_miles:.1f}",
+    )
 
     response = await client.messages.create(
         model=MODEL,
-        max_tokens=2048,
+        max_tokens=MAX_TOKENS,
+        system=system_prompt,
         messages=[
             {
                 "role": "user",
@@ -98,21 +113,131 @@ async def analyze_image_with_claude(
                             "data": image_b64,
                         },
                     },
-                    {"type": "text", "text": prompt},
+                    {"type": "text", "text": user_prompt},
                 ],
             }
         ],
     )
 
-    # TODO: Parse Claude's JSON response into CellAnalysis
-    # For now, return a placeholder
     raw_text = response.content[0].text
-    usage = response.usage
+    parsed = _extract_json_from_response(raw_text)
+    parsed["raw_response"] = raw_text
+    return parsed
 
-    # Parsing logic will go here — extract JSON from raw_text,
-    # map sub_cell_centers onto each CellScore, and build the CellAnalysis
 
-    raise NotImplementedError(
-        "JSON response parsing not yet implemented. "
-        f"Raw response length: {len(raw_text)} chars"
+async def confirm_fishing_water(
+    image_path: str,
+    parent_context: str,
+    center: tuple[float, float],
+    coverage_miles: float,
+) -> dict:
+    """Confirm whether a raw satellite image contains fishable inshore water.
+
+    Used as a second-pass filter: after grid scoring flags a cell as potentially
+    interesting, this function checks the zoomed-in raw image to confirm there
+    is actually fishable water before committing to grid analysis.
+
+    Returns dict with has_fishing_water (bool), reasoning (str), raw_response (str).
+    """
+    client = _get_client()
+
+    with open(image_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    system_prompt = _load_prompt("confirmation_system.txt")
+
+    context_line = ""
+    if parent_context:
+        context_line = f"\nParent area context:\n{parent_context}\n"
+
+    user_template = _load_prompt("confirmation_user.txt")
+    user_prompt = user_template.format(
+        parent_context=context_line,
+        center_lat=f"{center[0]:.4f}",
+        center_lon=f"{center[1]:.4f}",
+        coverage_miles=f"{coverage_miles:.1f}",
     )
+
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=2048,
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": user_prompt},
+                ],
+            }
+        ],
+    )
+
+    raw_text = response.content[0].text
+    parsed = _extract_json_from_response(raw_text)
+    parsed["raw_response"] = raw_text
+    return parsed
+
+
+async def analyze_structure_image(
+    image_path: str,
+    parent_context: str,
+    center: tuple[float, float],
+    coverage_miles: float,
+) -> dict:
+    """Send a raw satellite image to Claude for detailed structure analysis.
+
+    Uses chain-of-thought. Returns the parsed JSON plus raw_response.
+    """
+    client = _get_client()
+
+    with open(image_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    system_prompt = _load_prompt("structure_analysis_system.txt")
+
+    context_line = ""
+    if parent_context:
+        context_line = f"\nContext from parent analysis:\n{parent_context}\n"
+
+    user_template = _load_prompt("structure_analysis_user.txt")
+    user_prompt = user_template.format(
+        parent_context=context_line,
+        center_lat=f"{center[0]:.4f}",
+        center_lon=f"{center[1]:.4f}",
+        coverage_miles=f"{coverage_miles:.2f}",
+    )
+
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": user_prompt},
+                ],
+            }
+        ],
+    )
+
+    raw_text = response.content[0].text
+    parsed = _extract_json_from_response(raw_text)
+    parsed["raw_response"] = raw_text
+    return parsed

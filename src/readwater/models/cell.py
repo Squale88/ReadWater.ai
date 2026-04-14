@@ -2,18 +2,7 @@
 
 from __future__ import annotations
 
-from enum import Enum
 from pydantic import BaseModel, Field
-
-
-class ZoomLevel(int, Enum):
-    """Named zoom levels for the recursive analysis pipeline."""
-
-    MACRO = 0       # ~30 miles — macro hydrology, major water bodies
-    ZONE = 1        # ~10 miles — distinct fishing zones
-    SUBZONE = 2     # ~3.3 miles — sub-zones within a zone
-    AREA = 3        # ~1.1 miles — individual fishing areas
-    STRUCTURE = 4   # ~0.37 miles — structure-level detail
 
 
 class BoundingBox(BaseModel):
@@ -48,6 +37,14 @@ class CellAnalysis(BaseModel):
         default_factory=list,
         description="Types of fishable structure identified (e.g., grass flat, oyster bar, channel)",
     )
+    hydrology_notes: str = Field(
+        default="",
+        description="Water flow, tidal exchange, and current pattern observations",
+    )
+    structure_analysis: dict = Field(
+        default_factory=dict,
+        description="Full structure breakdown for terminal-level (zoom 18) cells",
+    )
     model_used: str = Field(default="claude-sonnet-4-20250514")
     prompt_tokens: int = Field(default=0)
     completion_tokens: int = Field(default=0)
@@ -64,9 +61,14 @@ class Cell(BaseModel):
     id: str = Field(description="Unique cell identifier (e.g., 'root', 'root-1-2', 'root-1-2-0-1')")
     parent_id: str | None = Field(default=None, description="Parent cell ID, None for root")
     center: tuple[float, float] = Field(description="(lat, lon) center point")
-    size_miles: float = Field(description="Side length of the square cell in miles")
-    zoom_level: int = Field(ge=0, description="Depth in the recursion tree (0=root)")
+    size_miles: float = Field(description="Approximate ground coverage in miles")
+    depth: int = Field(default=0, ge=0, description="Tree depth (0=root)")
+    zoom_level: int = Field(ge=0, description="Google Maps zoom level (e.g., 10-18)")
     bbox: BoundingBox = Field(description="Geographic bounding box")
     analysis: CellAnalysis | None = Field(default=None, description="Claude's analysis, None if not yet analyzed")
-    image_path: str | None = Field(default=None, description="Path to saved satellite image")
+    image_path: str | None = Field(default=None, description="First provider image path (convenience)")
+    provider_images: dict[str, str] = Field(
+        default_factory=dict,
+        description="Provider name -> image file path for multi-provider cells",
+    )
     children_ids: list[str] = Field(default_factory=list, description="IDs of child cells that passed threshold")

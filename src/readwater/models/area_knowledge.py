@@ -40,8 +40,12 @@ class AreaKnowledge(BaseModel):
         return [self.cells[cid] for cid in cell.children_ids if cid in self.cells]
 
     def get_cells_at_level(self, zoom_level: int) -> list[Cell]:
-        """Get all cells at a specific zoom level."""
+        """Get all cells at a specific Google Maps zoom level."""
         return [c for c in self.cells.values() if c.zoom_level == zoom_level]
+
+    def get_cells_at_depth(self, depth: int) -> list[Cell]:
+        """Get all cells at a specific tree depth (0=root)."""
+        return [c for c in self.cells.values() if c.depth == depth]
 
     def get_leaf_cells(self) -> list[Cell]:
         """Get all leaf cells (no children) — these are the finest-grained analysis."""
