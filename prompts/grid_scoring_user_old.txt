@@ -1,0 +1,55 @@
+Analyze this satellite image for inshore fishing potential.
+
+{parent_context}
+
+Zoom level: {current_zoom}
+Center: ({center_lat}, {center_lon})
+Approximate coverage: {coverage_miles} miles per side
+
+You are looking at a satellite image divided into a 4x4 numbered grid. Score each numbered cell 0-10 for INSHORE FISHING POTENTIAL using these criteria:
+
+SCORE 8-10 (Prime fishing structure):
+- Tidal passes and inlets connecting bays/backwater to open water — these are among the most productive features and should score high even if the rest of the cell is developed
+- Mangrove shoreline edges where water meets vegetation
+- Visible grass flats (lighter green/tan shallow areas)
+- Oyster bars (dark rough-textured patches in shallow water)
+- Major channels connecting bodies of water
+- Confluences where creeks or channels merge
+- Any cell containing a significant tidal exchange point scores high regardless of what else is in the cell
+
+SCORE 5-7 (Moderate potential):
+- Open shallow water without obvious structure but connected to productive areas
+- Mangrove or wetland areas with some visible water access
+- Depth transitions visible as water color changes
+- Residential canals that visibly connect to passes, bays, or open tidal water — these ARE fishable (snook, redfish use connected canal systems)
+- Areas where structure is partially visible and might reveal more at higher zoom
+
+SCORE 2-4 (Low potential):
+- Mostly open deep water (solid dark blue) with minimal shoreline or structure
+- Large areas of dense interior mangrove with no visible water channels or access
+- Areas that are mostly development but contain some peripheral waterfront
+
+SCORE 0-1 (No fishing potential — skip):
+- Residential subdivisions, commercial areas, parking lots, roads with no meaningful water
+- Agricultural land, cleared land, golf courses
+- Retention ponds, isolated water features not connected to tidal water
+- Interior residential canals in landlocked subdivisions with no visible connection to bays, passes, or tidal water
+- Beach with no adjacent backwater structure
+
+CRITICAL DISTINCTION: The key question is "does the water in this cell connect to the tidal system?" Residential canals that connect to a pass or bay ARE fishable. Retention ponds and isolated canal loops surrounded by development with no tidal connection are NOT. When in doubt about connectivity, score 3-4 to allow a closer look at the next zoom level rather than eliminating it.
+
+ANCHOR FEATURE RULE: If a cell contains even one high-value feature (a pass, a major channel, a tidal exchange point), score the cell based on THAT FEATURE, not the overall land use. A cell that is 80% subdivision but contains a tidal pass should score 8+.
+
+
+After your analysis, provide a JSON block with your scores in this exact format:
+
+```json
+{{
+  "summary": "overall description of what is visible",
+  "sub_scores": [
+    {{"cell_number": 1, "score": 0.0, "reasoning": "brief explanation"}},
+    ...all 16 cells...
+  ],
+  "hydrology_notes": "observations about water flow, tidal exchange, currents"
+}}
+```
