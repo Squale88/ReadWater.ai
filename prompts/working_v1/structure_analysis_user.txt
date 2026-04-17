@@ -1,0 +1,29 @@
+Analyze this satellite image for fishable structure.
+
+{parent_context}
+
+Center: ({center_lat}, {center_lon})
+Approximate coverage: {coverage_miles} miles per side
+
+Identify all fishable features and provide detailed fishing guidance.
+
+After your analysis, provide a JSON block with your findings in this exact format:
+
+```json
+{{
+  "summary": "overall description of the area",
+  "fishable_features": [
+    {{
+      "feature_type": "grass_flat|oyster_bar|channel|mangrove_edge|sand_hole|point|depth_transition|current_seam",
+      "description": "what it looks like and where in the image",
+      "relative_position": "e.g. northwest quadrant, center-east",
+      "fishing_notes": "how and when this feature would fish"
+    }}
+  ],
+  "tide_interaction": "how tides affect this area",
+  "wind_exposure": "protection and exposure by wind direction",
+  "recommended_species": ["species1", "species2"],
+  "access_notes": "approach by kayak or boat",
+  "overall_rating": 0.0
+}}
+```

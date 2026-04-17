@@ -1,0 +1,13 @@
+Give this area a complete review to identify the potential for inshore saltwater fishing in this area. Make note of all connected waterways. Which of these areas contain inshore fishing grounds. Generally, inshore fishing grounds are water connected to an estuary or bay or inlet with connection to natural shoreline. Just give me the list of areas that have saltwater inshore fishing opportunities. If there are none, say none and set has_fishing_water to false.
+
+{parent_context}
+Center: ({center_lat}, {center_lon})
+Coverage: ~{coverage_miles} miles per side
+
+Respond with JSON:
+```json
+{{
+  "has_fishing_water": true,
+  "reasoning": "brief explanation of what you see"
+}}
+```

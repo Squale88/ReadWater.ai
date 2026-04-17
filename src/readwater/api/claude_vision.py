@@ -15,7 +15,7 @@ from pathlib import Path
 
 import anthropic
 
-MODEL = "claude-opus-4-20250514"
+MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 8192
 
 # Locate prompts directory relative to project root
@@ -69,6 +69,8 @@ async def analyze_grid_image(
     current_zoom: int,
     center: tuple[float, float],
     coverage_miles: float,
+    user_prompt_file: str = "grid_scoring_user.txt",
+    context_image_path: str | None = None,
 ) -> dict:
     """Send a grid-overlay satellite image to Claude for cell-by-cell scoring.
 
@@ -76,6 +78,11 @@ async def analyze_grid_image(
     a JSON block with scores. Returns a dict with:
     - raw_response: str — Claude's full reasoning text
     - summary, sub_scores, hydrology_notes — parsed from the JSON block
+
+    If context_image_path is provided, a second (wider-area) image is sent
+    alongside the gridded image. The model is told to use it for context —
+    particularly helpful for distinguishing interior bay water (surrounded
+    by land in the wider view) from open ocean (nothing but water).
     """
     client = _get_client()
 
@@ -88,7 +95,7 @@ async def analyze_grid_image(
     if parent_context:
         context_line = f"\nParent cell context:\n{parent_context}\n"
 
-    user_template = _load_prompt("grid_scoring_user.txt")
+    user_template = _load_prompt(user_prompt_file)
     user_prompt = user_template.format(
         parent_context=context_line,
         current_zoom=current_zoom,
@@ -97,32 +104,121 @@ async def analyze_grid_image(
         coverage_miles=f"{coverage_miles:.1f}",
     )
 
+    # Build content with optional context image first, then the gridded image.
+    content = []
+    if context_image_path:
+        with open(context_image_path, "rb") as f:
+            ctx_b64 = base64.b64encode(f.read()).decode("utf-8")
+        content.append({
+            "type": "text",
+            "text": "CONTEXT IMAGE (wider area, no grid) — use ONLY to understand the surroundings of the gridded cell:",
+        })
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": ctx_b64},
+        })
+        content.append({
+            "type": "text",
+            "text": "GRIDDED IMAGE (your scoring target, 4x4 numbered grid) — score the cells in this image:",
+        })
+    content.append({
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+    })
+    content.append({"type": "text", "text": user_prompt})
+
     response = await client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_b64,
-                        },
-                    },
-                    {"type": "text", "text": user_prompt},
-                ],
-            }
-        ],
+        messages=[{"role": "user", "content": content}],
     )
 
     raw_text = response.content[0].text
     parsed = _extract_json_from_response(raw_text)
     parsed["raw_response"] = raw_text
     return parsed
+
+
+async def dual_pass_grid_scoring(
+    image_path: str,
+    parent_context: str,
+    current_zoom: int,
+    center: tuple[float, float],
+    coverage_miles: float,
+    context_image_path: str | None = None,
+) -> dict:
+    """Run YES-lean and NO-lean grid scoring passes and merge results.
+
+    Pass 1 uses grid_scoring_user.txt (lean YES).
+    Pass 2 uses grid_scoring_user2.txt (lean NO).
+
+    Merged scores per cell:
+      5 — both passes said YES (confident keep)
+      3 — passes disagreed (ambiguous, needs confirmation)
+      0 — both passes said NO (confident prune)
+
+    If context_image_path is provided, a wider-area image (2x coverage) is
+    sent alongside the gridded image. Helps distinguish interior bay water
+    from open ocean.
+
+    Returns a merged result dict with summary, sub_scores, hydrology_notes,
+    raw_response_yes, and raw_response_no.
+    """
+    import json as _json
+
+    async def _one_pass(prompt_file, label):
+        for retry in range(3):
+            try:
+                result = await analyze_grid_image(
+                    image_path, parent_context, current_zoom, center,
+                    coverage_miles, user_prompt_file=prompt_file,
+                    context_image_path=context_image_path,
+                )
+                scores = {sc["cell_number"]: float(sc["score"]) for sc in result.get("sub_scores", [])}
+                if len(scores) == 16:
+                    return result, scores
+            except (_json.JSONDecodeError, KeyError):
+                pass
+        # All retries failed — return empty scores
+        return {"sub_scores": [], "summary": "", "hydrology_notes": "", "raw_response": ""}, {}
+
+    result_yes, scores_yes = await _one_pass("grid_scoring_user.txt", "YES")
+    result_no, scores_no = await _one_pass("grid_scoring_user2.txt", "NO")
+
+    # Merge: both YES → 5, both NO → 0, disagree → 3
+    merged_sub_scores = []
+    for cell_num in range(1, 17):
+        ky = scores_yes.get(cell_num, 0) >= 4
+        kn = scores_no.get(cell_num, 0) >= 4
+        if ky and kn:
+            score = 5.0
+        elif not ky and not kn:
+            score = 0.0
+        else:
+            score = 3.0
+
+        # Use reasoning from whichever pass scored higher
+        reasoning = ""
+        for sc in result_yes.get("sub_scores", []):
+            if sc.get("cell_number") == cell_num:
+                reasoning = sc.get("reasoning", "")
+                break
+
+        merged_sub_scores.append({
+            "cell_number": cell_num,
+            "score": score,
+            "reasoning": reasoning,
+        })
+
+    return {
+        "summary": result_yes.get("summary", ""),
+        "sub_scores": merged_sub_scores,
+        "hydrology_notes": result_yes.get("hydrology_notes", ""),
+        "raw_response": result_yes.get("raw_response", ""),
+        "raw_response_yes": result_yes.get("raw_response", ""),
+        "raw_response_no": result_no.get("raw_response", ""),
+    }
 
 
 async def confirm_fishing_water(
