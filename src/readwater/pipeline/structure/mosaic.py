@@ -365,6 +365,7 @@ def _draw_polygon(
     fill_alpha: int | None = None,
     label: str | None = None,
     font: ImageFont.ImageFont | None = None,
+    dashed: bool = False,
 ) -> None:
     if len(polygon_px) < 3:
         return
@@ -375,16 +376,80 @@ def _draw_polygon(
     for i in range(len(pts)):
         a = pts[i]
         b = pts[(i + 1) % len(pts)]
-        draw.line([a, b], fill=color, width=width)
+        if dashed:
+            _draw_dashed_line(draw, a, b, color, width=width, dash=14, gap=10)
+        else:
+            draw.line([a, b], fill=color, width=width)
     if label and font is not None:
         cx = sum(p[0] for p in pts) // len(pts)
         cy = sum(p[1] for p in pts) // len(pts)
-        # Black outline + white fill for legibility
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 if dx or dy:
                     draw.text((cx + dx, cy + dy), label, fill="black", font=font)
         draw.text((cx, cy), label, fill="white", font=font)
+
+
+def _draw_dashed_line(
+    draw: ImageDraw.ImageDraw,
+    a: tuple[int, int],
+    b: tuple[int, int],
+    color: tuple[int, int, int],
+    width: int = 3,
+    dash: int = 14,
+    gap: int = 10,
+) -> None:
+    import math as _m
+    x0, y0 = a
+    x1, y1 = b
+    dx = x1 - x0
+    dy = y1 - y0
+    length = _m.hypot(dx, dy)
+    if length < 1e-6:
+        return
+    ux = dx / length
+    uy = dy / length
+    step = dash + gap
+    pos = 0.0
+    while pos < length:
+        seg_end = min(pos + dash, length)
+        p0 = (int(round(x0 + ux * pos)), int(round(y0 + uy * pos)))
+        p1 = (int(round(x0 + ux * seg_end)), int(round(y0 + uy * seg_end)))
+        draw.line([p0, p1], fill=color, width=width)
+        pos += step
+
+
+def _draw_seed_points(
+    draw: ImageDraw.ImageDraw,
+    label: str,
+    positives: list[tuple[int, int]],
+    negatives: list[tuple[int, int]],
+    font: ImageFont.ImageFont,
+) -> None:
+    radius = 7
+    for (x, y) in positives:
+        draw.ellipse(
+            [x - radius, y - radius, x + radius, y + radius],
+            fill=(0, 220, 0),      # green
+            outline=(0, 0, 0),
+            width=2,
+        )
+    for (x, y) in negatives:
+        draw.ellipse(
+            [x - radius, y - radius, x + radius, y + radius],
+            fill=(255, 30, 30),    # red
+            outline=(0, 0, 0),
+            width=2,
+        )
+    # Label near the first positive, slightly offset so it doesn't cover the dot.
+    if positives:
+        x, y = positives[0]
+        tx, ty = x + radius + 2, y - radius - 14
+        for dxo in (-1, 0, 1):
+            for dyo in (-1, 0, 1):
+                if dxo or dyo:
+                    draw.text((tx + dxo, ty + dyo), label, fill="black", font=font)
+        draw.text((tx, ty), label, fill="white", font=font)
 
 
 def render_annotated(
@@ -394,42 +459,90 @@ def render_annotated(
     complex_polygons_px: list[tuple[str, list[tuple[int, int]]]],
     influence_polygons_px: list[tuple[str, list[tuple[int, int]]]],
     subzone_polygons_px: list[tuple[str, list[tuple[int, int]]]],
+    seed_points_px: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]] | None = None,
 ) -> str:
-    """Render all four zone levels on top of a base image and save."""
+    """Render all four zone levels on top of a base image and save.
+
+    Anchors, local-complex members, and subzones are OBSERVED geometry and
+    are drawn with SOLID outlines. InfluenceZone is INTERPRETED geometry
+    and is drawn with a DASHED outline plus a translucent fill.
+
+    `seed_points_px` is a list of (label, positives, negatives). When given,
+    green/red dots are drawn on top of everything else showing where the
+    LLM clicked for each feature.
+    """
     canvas = base_image.convert("RGBA").copy()
     overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     font = _load_font(20)
     small = _load_font(14)
+    tiny = _load_font(12)
 
-    # Paint in order: influence (translucent fill) < complex < anchor < subzones
+    # Paint order: influence (translucent + dashed) < complex < anchor < subzones < seeds.
     for label, poly in influence_polygons_px:
-        _draw_polygon(draw, poly, _ZONE_COLORS["influence"], width=3, fill_alpha=60, label=label, font=small)
+        _draw_polygon(
+            draw, poly, _ZONE_COLORS["influence"],
+            width=3, fill_alpha=60, label=label, font=small, dashed=True,
+        )
     for label, poly in complex_polygons_px:
-        _draw_polygon(draw, poly, _ZONE_COLORS["complex"], width=3, label=label, font=small)
+        _draw_polygon(
+            draw, poly, _ZONE_COLORS["complex"],
+            width=3, label=label, font=small,
+        )
     for label, poly in anchor_polygons_px:
-        _draw_polygon(draw, poly, _ZONE_COLORS["anchor"], width=5, label=label, font=font)
+        _draw_polygon(
+            draw, poly, _ZONE_COLORS["anchor"],
+            width=5, label=label, font=font,
+        )
     for label, poly in subzone_polygons_px:
-        _draw_polygon(draw, poly, _ZONE_COLORS["subzone"], width=3, label=label, font=small)
+        _draw_polygon(
+            draw, poly, _ZONE_COLORS["subzone"],
+            width=3, label=label, font=small,
+        )
+
+    # Seed points on top.
+    if seed_points_px:
+        for label, positives, negatives in seed_points_px:
+            _draw_seed_points(draw, label, positives, negatives, tiny)
 
     # Legend
     legend_rows = [
-        ("Anchor", _ZONE_COLORS["anchor"]),
-        ("Local complex", _ZONE_COLORS["complex"]),
-        ("Influence zone", _ZONE_COLORS["influence"]),
-        ("Subzone", _ZONE_COLORS["subzone"]),
+        ("Anchor (observed)", _ZONE_COLORS["anchor"], "solid"),
+        ("Member (observed)", _ZONE_COLORS["complex"], "solid"),
+        ("Influence (interpreted)", _ZONE_COLORS["influence"], "dashed"),
+        ("Subzone (observed)", _ZONE_COLORS["subzone"], "solid"),
+        ("Seed + / -", (0, 220, 0), "dots"),
     ]
     pad = 12
-    sw = 20
+    sw = 24
     row_h = 26
-    legend_w = 220
+    legend_w = 260
     legend_h = pad * 2 + row_h * len(legend_rows)
     lx = pad
     ly = canvas.size[1] - legend_h - pad
     draw.rectangle([lx, ly, lx + legend_w, ly + legend_h], fill=(0, 0, 0, 180))
-    for i, (name, color) in enumerate(legend_rows):
+    for i, (name, color, style) in enumerate(legend_rows):
         y = ly + pad + i * row_h
-        draw.rectangle([lx + pad, y + 3, lx + pad + sw, y + 3 + 16], fill=color)
+        swatch_x0 = lx + pad
+        swatch_y0 = y + 3
+        swatch_x1 = swatch_x0 + sw
+        swatch_y1 = swatch_y0 + 16
+        if style == "solid":
+            draw.rectangle([swatch_x0, swatch_y0, swatch_x1, swatch_y1], fill=color)
+        elif style == "dashed":
+            # Show a dashed line as the swatch
+            _draw_dashed_line(
+                draw, (swatch_x0, (swatch_y0 + swatch_y1) // 2),
+                (swatch_x1, (swatch_y0 + swatch_y1) // 2),
+                color, width=3, dash=6, gap=3,
+            )
+        elif style == "dots":
+            # Green dot + red dot side by side
+            cy = (swatch_y0 + swatch_y1) // 2
+            draw.ellipse([swatch_x0, cy - 4, swatch_x0 + 8, cy + 4],
+                         fill=(0, 220, 0), outline=(0, 0, 0), width=1)
+            draw.ellipse([swatch_x0 + 14, cy - 4, swatch_x0 + 22, cy + 4],
+                         fill=(255, 30, 30), outline=(0, 0, 0), width=1)
         draw.text((lx + pad + sw + 10, y), name, fill="white", font=small)
 
     out = Image.alpha_composite(canvas, overlay).convert("RGB")

@@ -1,0 +1,27 @@
+Anchor metadata:
+  id: {anchor_id}
+  type: {structure_type}
+  scale: {scale}
+  rationale: {rationale}
+
+The anchor polygon, local-complex member polygons, and influence-zone polygon have already been drawn on the mosaic for reference. Click on up to 4 compact fishable subzones within the influence zone.
+
+All coordinates are normalized fractions 0.0-1.0 of the mosaic, (0, 0) top-left.
+
+Valid subzone types (v1): drain_throat, point_tip, oyster_bar_edge, pocket_mouth, island_tip_seam.
+
+```json
+{{
+  "subzones": [
+    {{
+      "subzone_id": "{anchor_id}-s1",
+      "subzone_type": "drain_throat",
+      "positive_points": [[0.62, 0.42], [0.60, 0.48]],
+      "negative_points": [[0.50, 0.30]],
+      "relative_priority": 1.0,
+      "reasoning_summary": "tightest current funnel, ambush lane on outgoing",
+      "confidence": 0.85
+    }}
+  ]
+}}
+```

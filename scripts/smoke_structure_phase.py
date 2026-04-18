@@ -107,8 +107,14 @@ async def run_one(cell_id: str, budget: StructureBudget) -> None:
         print(f"  overlap entries: {len(result.overlap_report)}")
     if result.truncated_ids:
         print(f"  truncated: {result.truncated_ids}")
-    if result.failed_geometry_ids:
-        print(f"  failed_geometry: {result.failed_geometry_ids}")
+    if result.failed_identifications:
+        print(f"  failed_identifications: {len(result.failed_identifications)}")
+        for f in result.failed_identifications:
+            print(f"    {f.feature_id} ({f.feature_level}): {f.reason}")
+    if result.segmentation_issues:
+        print(f"  segmentation_issues: {len(result.segmentation_issues)}")
+        for s in result.segmentation_issues:
+            print(f"    {s.feature_id} ({s.feature_level}): {s.reason}")
     print(f"  api_calls_used: {result.api_calls_used}")
     print(f"  tiles_fetched:  {result.tiles_fetched}")
     print(f"  registry: {result.registry_path}")

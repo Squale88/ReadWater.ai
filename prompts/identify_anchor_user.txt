@@ -1,0 +1,56 @@
+Anchor metadata:
+  id: {anchor_id}
+  type: {structure_type}
+  scale: {scale}
+  rationale: {rationale}
+
+Click points for the anchor and each of its local-complex member features, and draw the influence-zone polygon.
+
+All coordinates are normalized fractions 0.0-1.0 of the mosaic, (0, 0) top-left.
+
+```json
+{{
+  "anchor": {{
+    "positive_points": [[0.58, 0.42]],
+    "negative_points": [[0.30, 0.30]],
+    "notes": "drain throat between the two flanking mangrove fingers"
+  }},
+  "local_complex": {{
+    "members": [
+      {{
+        "name": "left flanking point",
+        "feature_type": "point",
+        "positive_points": [[0.42, 0.38]],
+        "negative_points": [],
+        "notes": ""
+      }},
+      {{
+        "name": "receiving basin",
+        "feature_type": "basin",
+        "positive_points": [[0.68, 0.55]],
+        "negative_points": [],
+        "notes": ""
+      }}
+    ],
+    "relationship_summary": "drain throat funnels into the receiving basin; left point provides ambush lane"
+  }},
+  "influence_zone": {{
+    "polygon": [[0.30, 0.30], [0.80, 0.32], [0.85, 0.60], [0.70, 0.72], [0.35, 0.70]],
+    "shape_type": "fan",
+    "dominance_strength": 0.8,
+    "bounded_by": ["shoreline to the north", "deep basin to the south"],
+    "competing_structures": []
+  }}
+}}
+```
+
+Escape hatch for the influence zone when you are uncertain of a clean boundary:
+```json
+"influence_zone": {{
+  "polygon": {{"convex_hull_of_anchor": true, "expand_frac": 0.10}},
+  "shape_type": "radial",
+  "dominance_strength": 0.6,
+  "bounded_by": [],
+  "competing_structures": []
+}}
+```

@@ -1,11 +1,15 @@
-"""Thin Claude-vision wrappers for the four structure-phase prompts.
+"""Thin Claude-vision wrappers for the structure-phase prompts.
 
-These mirror the style of `api/claude_vision.py` but keep the structure-phase
-prompt invocations isolated in one file. All functions:
-  - load the relevant system/user prompt templates from prompts/,
-  - format the user template,
-  - call Claude with one or two images,
-  - return the parsed JSON plus the raw response text under `raw_response`.
+Phase 1 prompts:
+  discover_anchors      — at cell level, enumerate candidate anchors with
+                          rough normalized bboxes and continuation edges
+  resolve_continuation  — on a mosaic, decide whether to expand tiles
+  identify_anchor       — click points + influence polygon for one anchor
+  identify_subzones     — click points for up to 4 subzones
+
+Every wrapper returns the parsed JSON plus raw_response text. Coordinates
+come back as normalized fractions [0, 1] of the image Claude saw, except
+resolve_continuation which returns only edge booleans.
 """
 
 from __future__ import annotations
@@ -24,23 +28,21 @@ from readwater.api.claude_vision import (
     _load_prompt,
 )
 
-# Claude caps base64 images at 5 MB decoded. JPEG re-encoding is used for all
-# uploads because the stitched mosaic PNGs routinely exceed this as PNG. A
-# fallback resize catches the rare very-large image.
-_MAX_UPLOAD_BYTES = 5 * 1024 * 1024 - 64 * 1024  # leave a little headroom
+_MAX_UPLOAD_BYTES = 5 * 1024 * 1024 - 64 * 1024
 _UPLOAD_JPEG_QUALITY = 85
 _UPLOAD_MAX_DIM = 1800
 
 
 def _image_block(path: str | Path) -> dict:
-    """Re-encode an image as JPEG (with an optional downscale) for Claude upload."""
+    """Re-encode an image as JPEG (with optional downscale) for Claude upload.
+
+    Stays under Anthropic's 5 MB base64 cap by resizing or dropping quality
+    as needed.
+    """
     img = Image.open(path)
     if img.mode != "RGB":
         img = img.convert("RGB")
 
-    # Cap longest dimension defensively; the agent already caps mosaic canvases
-    # via MAX_MOSAIC_DIM, but z15/z16 source PNGs and any future inputs may be
-    # larger.
     longest = max(img.size)
     if longest > _UPLOAD_MAX_DIM:
         ratio = _UPLOAD_MAX_DIM / longest
@@ -48,19 +50,20 @@ def _image_block(path: str | Path) -> dict:
         img = img.resize(new_size, Image.LANCZOS)
 
     quality = _UPLOAD_JPEG_QUALITY
+    data = b""
     for _ in range(4):
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
         data = buf.getvalue()
         if len(data) <= _MAX_UPLOAD_BYTES:
             break
-        # Still too big -> drop quality or downscale further
         if quality > 60:
             quality -= 10
         else:
             img = img.resize(
                 (int(img.size[0] * 0.85), int(img.size[1] * 0.85)), Image.LANCZOS,
             )
+
     return {
         "type": "image",
         "source": {
@@ -69,6 +72,9 @@ def _image_block(path: str | Path) -> dict:
             "data": base64.b64encode(data).decode("utf-8"),
         },
     }
+
+
+# --- DISCOVER ---
 
 
 async def discover_anchors(
@@ -115,6 +121,9 @@ async def discover_anchors(
     return parsed
 
 
+# --- RESOLVE_CONTINUATION ---
+
+
 async def resolve_continuation(
     mosaic_image_path: str,
     anchor: dict,
@@ -130,7 +139,9 @@ async def resolve_continuation(
     user_template = _load_prompt("resolve_continuation_user.txt")
 
     prior = anchor.get("continuation_edges") or {}
-    prior_edges = ", ".join(f"{k}={bool(prior.get(k))}" for k in ("north", "south", "east", "west"))
+    prior_edges = ", ".join(
+        f"{k}={bool(prior.get(k))}" for k in ("north", "south", "east", "west")
+    )
 
     user_prompt = user_template.format(
         structure_type=anchor.get("structure_type", "unknown"),
@@ -165,25 +176,37 @@ async def resolve_continuation(
     return parsed
 
 
-async def model_influence(
+# --- IDENTIFY_ANCHOR (seeds + members + influence polygon) ---
+
+
+async def identify_anchor(
     mosaic_image_path: str,
     anchor: dict,
-    mosaic_width: int,
-    mosaic_height: int,
+    feedback_note: str = "",
 ) -> dict:
-    """MODEL_INFLUENCE: produce anchor/complex/influence polygons on the mosaic."""
+    """IDENTIFY_ANCHOR: click points for the anchor and its complex members,
+    plus the influence-zone polygon.
+
+    `feedback_note` is appended to the user prompt when the validator has
+    rejected an earlier attempt and we're asking for a regeneration. It
+    describes the specific seed issue to correct.
+    """
     client = _get_client()
-    system_prompt = _load_prompt("model_influence_system.txt")
-    user_template = _load_prompt("model_influence_user.txt")
+    system_prompt = _load_prompt("identify_anchor_system.txt")
+    user_template = _load_prompt("identify_anchor_user.txt")
 
     user_prompt = user_template.format(
         anchor_id=anchor.get("anchor_id", "a1"),
         structure_type=anchor.get("structure_type", "unknown"),
         scale=anchor.get("scale", "minor"),
         rationale=anchor.get("rationale", ""),
-        mosaic_width=mosaic_width,
-        mosaic_height=mosaic_height,
     )
+    if feedback_note:
+        user_prompt = (
+            user_prompt
+            + "\n\nNOTE: a previous attempt at these seeds failed validation. "
+            + f"Issue: {feedback_note}. Please correct it in this response.\n"
+        )
 
     response = await client.messages.create(
         model=MODEL,
@@ -205,25 +228,34 @@ async def model_influence(
     return parsed
 
 
-async def define_subzones(
+# --- IDENTIFY_SUBZONES (seeds for subzones only) ---
+
+
+async def identify_subzones(
     mosaic_image_path: str,
     anchor: dict,
-    mosaic_width: int,
-    mosaic_height: int,
+    feedback_note: str = "",
 ) -> dict:
-    """DEFINE_SUBZONES: compact fishable subzones within the influence zone."""
+    """IDENTIFY_SUBZONES: click points per subzone, constrained to v1 whitelist.
+
+    Like identify_anchor, accepts an optional feedback_note for regeneration.
+    """
     client = _get_client()
-    system_prompt = _load_prompt("define_subzones_system.txt")
-    user_template = _load_prompt("define_subzones_user.txt")
+    system_prompt = _load_prompt("identify_subzones_system.txt")
+    user_template = _load_prompt("identify_subzones_user.txt")
 
     user_prompt = user_template.format(
         anchor_id=anchor.get("anchor_id", "a1"),
         structure_type=anchor.get("structure_type", "unknown"),
         scale=anchor.get("scale", "minor"),
         rationale=anchor.get("rationale", ""),
-        mosaic_width=mosaic_width,
-        mosaic_height=mosaic_height,
     )
+    if feedback_note:
+        user_prompt = (
+            user_prompt
+            + "\n\nNOTE: a previous attempt at these seeds failed validation. "
+            + f"Issue: {feedback_note}. Please correct it in this response.\n"
+        )
 
     response = await client.messages.create(
         model=MODEL,
