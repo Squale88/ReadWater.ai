@@ -1,12 +1,12 @@
-Image 1 is the zoom-15 parent context (~0.75 miles per side). Image 2 is the zoom-16 cell image (~0.37 miles per side) — this is the tile to annotate.
+Image 1 is the zoom-15 parent context (~0.75 mi per side).
+Image 2 is the zoom-16 cell with a {grid_rows}x{grid_cols} labeled grid (~0.37 mi per side).
 
 {parent_context}
 Zoom-16 cell center: ({center_lat}, {center_lon})
 Zoom-16 coverage: ~{coverage_miles} miles per side
+Grid: {grid_rows} rows (A..{last_row}) x {grid_cols} columns (1..{grid_cols})
 
 List the anchor structures. Prefer fewer, higher-quality anchors over many weak ones.
-
-All coordinates are **normalized fractions 0.0–1.0** of the zoom-16 image, (0, 0) top-left, (1, 1) bottom-right.
 
 ```json
 {{
@@ -17,14 +17,13 @@ All coordinates are **normalized fractions 0.0–1.0** of the zoom-16 image, (0,
       "structure_type": "drain",
       "scale": "major",
       "rationale": "narrow tidal cut draining a shallow back bay",
-      "approx_bbox_frac": [0.35, 0.40, 0.20, 0.25],
-      "orientation_deg": 90,
       "confidence": 0.85,
       "expected_relevance": 0.8,
       "truncated_by_edge": false,
       "continuation_edges": {{"north": false, "south": false, "east": false, "west": false}},
       "expansion_priority": 0.2,
-      "parent_context_needed": false
+      "parent_context_needed": false,
+      "cells": ["C3", "C4", "D3", "D4"]
     }}
   ]
 }}

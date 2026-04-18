@@ -14,11 +14,9 @@ from readwater.api.providers.placeholder import PlaceholderProvider
 from readwater.api.providers.registry import ImageProviderRegistry
 from readwater.models.structure import StructurePhaseResult
 from readwater.pipeline.cell_analyzer import (
-    _image_filename,
     analyze_cell,
     ground_coverage_miles,
 )
-from readwater.pipeline.image_processing import draw_grid_overlay
 
 
 def _placeholder_structure_phase_result(cell_id: str = "test-cell") -> StructurePhaseResult:

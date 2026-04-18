@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 
 class ObservedGeometry(BaseModel):
-    """A polygon extracted from image observation via seed points."""
+    """A polygon extracted from image observation via grid cells or seed points."""
 
     pixel_polygon: list[tuple[int, int]] = Field(
         description="Polygon vertices in pixel space of the source image",
@@ -38,23 +38,37 @@ class ObservedGeometry(BaseModel):
     image_ref: str = Field(description="Name of the source image (e.g. 'mosaic')")
     extractor: str = Field(
         description="Name of the extractor that produced this polygon "
-        "(e.g. 'clickbox', 'sam2_region', 'fallback')",
+        "(e.g. 'gridcell', 'clickbox', 'sam2_region', 'fallback')",
     )
     extraction_mode: str = Field(
         description="Mode used: 'region' | 'corridor' | 'point_feature' | 'edge_band'",
     )
+    seed_cells: list[str] = Field(
+        default_factory=list,
+        description="Grid-cell labels Claude selected (e.g. ['C3', 'C4', 'D3']). "
+        "Empty when extraction was non-grid-based.",
+    )
+    grid_rows: int | None = Field(
+        default=None,
+        description="Rows of the grid Claude saw, when extractor='gridcell'",
+    )
+    grid_cols: int | None = Field(
+        default=None,
+        description="Columns of the grid Claude saw, when extractor='gridcell'",
+    )
     seed_positive_points: list[tuple[int, int]] = Field(
         default_factory=list,
-        description="Positive seed points (pixel coords) Claude identified inside the feature",
+        description="Positive seed points (pixel coords). For gridcell extraction, "
+        "these are the centroids of selected cells.",
     )
     seed_negative_points: list[tuple[int, int]] = Field(
         default_factory=list,
-        description="Negative seed points (pixel coords) Claude identified outside the feature",
+        description="Negative seed points (pixel coords). For gridcell extraction, "
+        "centroids of cells explicitly flagged as outside the feature.",
     )
     confidence: float | None = Field(
         default=None,
-        description="Extractor-reported quality, if supported (None for extractors "
-        "without a quality signal)",
+        description="Extractor-reported quality, if supported",
     )
 
 

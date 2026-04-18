@@ -1,6 +1,6 @@
 """Tests for data models."""
 
-from readwater.models.cell import BoundingBox, Cell, CellAnalysis, CellScore
+from readwater.models.cell import BoundingBox, Cell
 from readwater.models.area_knowledge import AreaKnowledge
 
 

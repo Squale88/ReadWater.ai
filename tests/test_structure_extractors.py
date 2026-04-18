@@ -1,4 +1,4 @@
-"""Tests for ClickBoxExtractor (four modes) + feature-type → mode routing."""
+"""Tests for the geometry extractors + feature-type → mode routing."""
 
 from __future__ import annotations
 
@@ -7,9 +7,12 @@ from PIL import Image
 
 from readwater.pipeline.structure.extractors import (
     ClickBoxExtractor,
+    GridCellExtractor,
     STRUCTURE_TYPE_TO_MODE,
     SUBZONE_TYPE_TO_MODE,
+    build_gridcell_registry,
     get_extractor,
+    get_fallback_extractor,
     is_subzone_type_allowed,
     mode_for,
 )
@@ -204,7 +207,8 @@ def test_mode_for_complex_member_vocabulary():
 # --- get_extractor dispatch ---
 
 
-def test_get_extractor_returns_correct_mode_instance():
+def test_get_extractor_fallback_returns_clickbox():
+    # With no registry passed, get_extractor falls back to ClickBoxExtractor.
     reg_ex = get_extractor("region")
     corr_ex = get_extractor("corridor")
     assert reg_ex.mode == "region"
@@ -220,3 +224,72 @@ def test_get_extractor_accepts_custom_registry():
     custom = {"region": ClickBoxExtractor("point_feature")}  # deliberately swapped
     ex = get_extractor("region", registry=custom)
     assert ex.mode == "point_feature"
+
+
+def test_get_fallback_extractor_is_always_clickbox():
+    assert isinstance(get_fallback_extractor("region"), ClickBoxExtractor)
+    assert isinstance(get_fallback_extractor("corridor"), ClickBoxExtractor)
+
+
+# --- GridCellExtractor ---
+
+
+def test_gridcell_region_single_cell_produces_cell_rect():
+    # 8x8 grid on 1600x1600 image = 200 px per cell.
+    ex = GridCellExtractor("region", 8, 8, (1600, 1600))
+    out = ex.extract(
+        Image.new("RGB", (1600, 1600), (0, 0, 0)),
+        positive_points=[(0, 0)],  # (row=0, col=0) = A1
+        negative_points=[],
+    )
+    assert len(out.pixel_polygon) == 4
+    xs = [p[0] for p in out.pixel_polygon]
+    ys = [p[1] for p in out.pixel_polygon]
+    assert min(xs) == 0 and max(xs) == 200
+    assert min(ys) == 0 and max(ys) == 200
+    assert out.extractor_name == "gridcell"
+
+
+def test_gridcell_region_multiple_cells_union_bbox():
+    ex = GridCellExtractor("region", 8, 8, (1600, 1600))
+    # Cells (2,2), (2,3), (3,2), (3,3) = C3, C4, D3, D4
+    out = ex.extract(
+        Image.new("RGB", (1600, 1600), (0, 0, 0)),
+        positive_points=[(2, 2), (2, 3), (3, 2), (3, 3)],
+        negative_points=[],
+    )
+    poly = out.pixel_polygon
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    assert min(xs) == 400 and max(xs) == 800
+    assert min(ys) == 400 and max(ys) == 800
+
+
+def test_gridcell_empty_returns_empty_polygon():
+    ex = GridCellExtractor("region", 8, 8, (1600, 1600))
+    out = ex.extract(
+        Image.new("RGB", (1600, 1600), (0, 0, 0)),
+        positive_points=[],
+        negative_points=[],
+    )
+    assert out.pixel_polygon == []
+
+
+def test_gridcell_unknown_mode_raises():
+    with pytest.raises(ValueError):
+        GridCellExtractor("nonsense", 8, 8, (1600, 1600))
+
+
+def test_build_gridcell_registry_returns_per_mode_extractors():
+    reg = build_gridcell_registry(8, 8, (1600, 1600))
+    assert set(reg.keys()) == {"region", "corridor", "point_feature", "edge_band"}
+    for mode, ex in reg.items():
+        assert isinstance(ex, GridCellExtractor)
+        assert ex.mode == mode
+
+
+def test_gridcell_registry_via_get_extractor():
+    reg = build_gridcell_registry(8, 8, (1600, 1600))
+    ex = get_extractor("corridor", registry=reg)
+    assert isinstance(ex, GridCellExtractor)
+    assert ex.mode == "corridor"

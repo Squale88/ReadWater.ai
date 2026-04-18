@@ -4,9 +4,9 @@ Anchor metadata:
   scale: {scale}
   rationale: {rationale}
 
-The anchor polygon, local-complex member polygons, and influence-zone polygon have already been drawn on the mosaic for reference. Click on up to 4 compact fishable subzones within the influence zone.
+Grid: {grid_rows} rows (A..{last_row}) x {grid_cols} columns (1..{grid_cols}).
 
-All coordinates are normalized fractions 0.0-1.0 of the mosaic, (0, 0) top-left.
+The anchor's core cells, its local-complex member cells, and the influence zone's cells have already been drawn on the mosaic for your reference. Now pick up to 4 compact fishable subzones.
 
 Valid subzone types (v1): drain_throat, point_tip, oyster_bar_edge, pocket_mouth, island_tip_seam.
 
@@ -16,10 +16,9 @@ Valid subzone types (v1): drain_throat, point_tip, oyster_bar_edge, pocket_mouth
     {{
       "subzone_id": "{anchor_id}-s1",
       "subzone_type": "drain_throat",
-      "positive_points": [[0.62, 0.42], [0.60, 0.48]],
-      "negative_points": [[0.50, 0.30]],
+      "cells": ["E4"],
       "relative_priority": 1.0,
-      "reasoning_summary": "tightest current funnel, ambush lane on outgoing",
+      "reasoning_summary": "tightest current funnel at the confluence",
       "confidence": 0.85
     }}
   ]

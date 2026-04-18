@@ -4,50 +4,46 @@ Anchor metadata:
   scale: {scale}
   rationale: {rationale}
 
-Click points for the anchor and each of its local-complex member features, and draw the influence-zone polygon.
+Grid: {grid_rows} rows (A..{last_row}) x {grid_cols} columns (1..{grid_cols}).
 
-All coordinates are normalized fractions 0.0-1.0 of the mosaic, (0, 0) top-left.
+Identify the anchor's core cells, local-complex member features with their cells, and the influence zone's cells (or "hull_of_anchor").
 
 ```json
 {{
   "anchor": {{
-    "positive_points": [[0.58, 0.42]],
-    "negative_points": [[0.30, 0.30]],
-    "notes": "drain throat between the two flanking mangrove fingers"
+    "cells": ["D4", "D5", "E4", "E5"],
+    "notes": "tight Y-junction confluence where the north and west channels merge"
   }},
   "local_complex": {{
     "members": [
       {{
         "name": "left flanking point",
         "feature_type": "point",
-        "positive_points": [[0.42, 0.38]],
-        "negative_points": [],
+        "cells": ["C3", "D3"],
         "notes": ""
       }},
       {{
         "name": "receiving basin",
         "feature_type": "basin",
-        "positive_points": [[0.68, 0.55]],
-        "negative_points": [],
-        "notes": ""
+        "cells": ["F5", "F6", "G5"]
       }}
     ],
-    "relationship_summary": "drain throat funnels into the receiving basin; left point provides ambush lane"
+    "relationship_summary": "channels feed into the confluence; the flanking point creates an ambush lane into the receiving basin"
   }},
   "influence_zone": {{
-    "polygon": [[0.30, 0.30], [0.80, 0.32], [0.85, 0.60], [0.70, 0.72], [0.35, 0.70]],
+    "cells": ["C3", "C4", "D3", "D4", "D5", "E4", "E5", "F5", "F6", "G5"],
     "shape_type": "fan",
     "dominance_strength": 0.8,
-    "bounded_by": ["shoreline to the north", "deep basin to the south"],
+    "bounded_by": ["mangrove shoreline to the north", "deep channel to the south"],
     "competing_structures": []
   }}
 }}
 ```
 
-Escape hatch for the influence zone when you are uncertain of a clean boundary:
+Escape hatch for the influence zone when a cell list isn't natural:
 ```json
 "influence_zone": {{
-  "polygon": {{"convex_hull_of_anchor": true, "expand_frac": 0.10}},
+  "cells": "hull_of_anchor",
   "shape_type": "radial",
   "dominance_strength": 0.6,
   "bounded_by": [],

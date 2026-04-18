@@ -1,16 +1,18 @@
-"""Structure-phase orchestrator (Phase 1).
+"""Structure-phase orchestrator (Phase 1.5: grid-cell edition).
 
 State machine:
   DISCOVER -> RANK_AND_DEFER -> per anchor:
     PLAN_CAPTURE -> FETCH -> RESOLVE_CONTINUATION (loop-capped)
-    -> IDENTIFY -> VALIDATE_SEEDS -> EXTRACT
-    -> IDENTIFY_SUBZONES -> VALIDATE_SUBZONE_SEEDS -> EXTRACT_SUBZONES
+    -> IDENTIFY (grid cells for anchor/members/influence)
+    -> VALIDATE_CELLS -> EXTRACT
+    -> IDENTIFY_SUBZONES (grid cells for subzones)
+    -> VALIDATE_SUBZONE_CELLS -> EXTRACT_SUBZONES
     -> INTERPRET -> ASSEMBLE
   -> FINALIZE
 
-Phase 1 uses ClickBoxExtractor for all extraction modes. Phase 2 replaces the
-region (and later corridor, edge_band) extractors with smarter implementations
-without touching this file. The separation is what makes that swap safe.
+Phase 1.5 uses GridCellExtractor for all features (polygon = bbox of cell
+union). Phase 2 replaces the region/corridor/edge_band extractors with SAM
+variants — same cell output from Claude, better polygon from the extractor.
 """
 
 from __future__ import annotations
@@ -21,7 +23,6 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
 
 from PIL import Image
 
@@ -43,10 +44,14 @@ from readwater.models.structure import (
 from readwater.pipeline.structure import prompts as llm
 from readwater.pipeline.structure.extractors import (
     ClickBoxExtractor,
-    ExtractorOutput,
+    build_gridcell_registry,
     get_extractor,
     is_subzone_type_allowed,
     mode_for,
+)
+from readwater.pipeline.structure.grid_overlay import (
+    cells_to_bbox,
+    cells_to_centroids,
 )
 from readwater.pipeline.structure.geo import clip_polygon_to_rect, pixel_to_latlon
 from readwater.pipeline.structure.mosaic import (
@@ -63,8 +68,7 @@ from readwater.pipeline.structure.mosaic import (
 )
 from readwater.pipeline.structure.seed_validator import (
     Verdict,
-    default_excluded_regions,
-    validate_seeds,
+    validate_cells,
 )
 
 logger = logging.getLogger(__name__)
@@ -80,10 +84,10 @@ class StructurePhase(str, Enum):
     FETCH = "fetch"
     RESOLVE_CONTINUATION = "resolve_continuation"
     IDENTIFY = "identify"
-    VALIDATE_SEEDS = "validate_seeds"
+    VALIDATE_CELLS = "validate_cells"
     EXTRACT = "extract"
     IDENTIFY_SUBZONES = "identify_subzones"
-    VALIDATE_SUBZONE_SEEDS = "validate_subzone_seeds"
+    VALIDATE_SUBZONE_CELLS = "validate_subzone_cells"
     EXTRACT_SUBZONES = "extract_subzones"
     INTERPRET = "interpret"
     ASSEMBLE = "assemble"
@@ -128,6 +132,7 @@ class StructurePaths:
     structures_root: Path
     discovery_image_path: Path
     registry_path: Path
+    grid_overlay_dir: Path
 
     @classmethod
     def for_cell(cls, base_output_dir: Path, cell_id: str) -> StructurePaths:
@@ -138,6 +143,7 @@ class StructurePaths:
             structures_root=structures_root,
             discovery_image_path=structures_root / "anchors_discovery.png",
             registry_path=structures_root / "registry.json",
+            grid_overlay_dir=structures_root / "grid_overlays",
         )
 
 
@@ -157,78 +163,91 @@ def _rank_anchor(a: dict) -> float:
     )
 
 
-def _frac_points_to_px(
-    frac_points: list,
-    width: int,
-    height: int,
-) -> list[tuple[int, int]]:
-    """Convert a list of [x_frac, y_frac] in [0,1] to pixel integer tuples."""
-    out: list[tuple[int, int]] = []
-    for pt in frac_points or []:
-        try:
-            x = int(round(float(pt[0]) * width))
-            y = int(round(float(pt[1]) * height))
-        except (TypeError, ValueError, IndexError):
-            continue
-        out.append((x, y))
-    return out
+# --- Cell-based geometry construction ---
 
 
-def _normalize_or_pixel_polygon(
-    polygon: list,
-    width: int,
-    height: int,
-) -> list[tuple[int, int]]:
-    """Interpret a polygon as normalized [0-1] or pixel coords, return pixel."""
-    if not polygon:
-        return []
-    flat = [v for pt in polygon for v in pt]
-    if flat and max(abs(v) for v in flat) <= 1.5:
-        return [
-            (int(round(float(p[0]) * width)), int(round(float(p[1]) * height)))
-            for p in polygon
-        ]
-    return [(int(round(p[0])), int(round(p[1]))) for p in polygon]
-
-
-def _build_observed_geometry(
-    extractor_output: ExtractorOutput,
+def _build_observed_from_cells(
+    cells: list[str],
+    parsed_cells: list[tuple[int, int]],
     mode: str,
     mosaic: Mosaic,
-    positive_points_px: list[tuple[int, int]],
-    negative_points_px: list[tuple[int, int]],
+    registry: dict,
     image_ref: str = "mosaic",
+    negative_cells: list[str] | None = None,
+    grid_rows: int = 0,
+    grid_cols: int = 0,
 ) -> ObservedGeometry | None:
-    """Clip the extractor's polygon to the mosaic and attach lat/lon."""
+    """Run the right extractor for `mode`, produce ObservedGeometry + latlon."""
+    extractor = get_extractor(mode, registry)
+    out = extractor.extract(
+        mosaic.image,
+        positive_points=parsed_cells,   # (row, col) pairs
+        negative_points=[],             # negative cells supported separately below
+    )
     clipped = clip_polygon_to_rect(
-        [(float(x), float(y)) for x, y in extractor_output.pixel_polygon],
+        [(float(x), float(y)) for x, y in out.pixel_polygon],
         mosaic.width,
         mosaic.height,
     )
     if len(clipped) < 3:
         return None
     latlon = mosaic.polygon_px_to_latlon(clipped)
+
+    pos_centroids = cells_to_centroids(
+        cells, grid_rows, grid_cols, (mosaic.width, mosaic.height),
+    )
+    neg_centroids = cells_to_centroids(
+        negative_cells or [], grid_rows, grid_cols, (mosaic.width, mosaic.height),
+    )
+
     return ObservedGeometry(
         pixel_polygon=clipped,
         latlon_polygon=latlon,
         image_ref=image_ref,
-        extractor=extractor_output.extractor_name,
+        extractor=out.extractor_name,
         extraction_mode=mode,
-        seed_positive_points=positive_points_px,
-        seed_negative_points=negative_points_px,
-        confidence=extractor_output.confidence,
+        seed_cells=list(cells),
+        grid_rows=grid_rows or None,
+        grid_cols=grid_cols or None,
+        seed_positive_points=pos_centroids,
+        seed_negative_points=neg_centroids,
+        confidence=out.confidence,
     )
 
 
-def _build_interpreted_geometry(
-    polygon_px: list[tuple[int, int]],
+def _build_interpreted_from_cells(
+    cells_field,
+    anchor_polygon_px: list[tuple[int, int]],
     mosaic: Mosaic,
-    source: str,
-    rationale: str = "",
-    image_ref: str = "mosaic",
+    grid_rows: int,
+    grid_cols: int,
 ) -> InterpretedGeometry | None:
+    """Turn an influence_zone cells field into an InterpretedGeometry.
+
+    Accepts:
+      - list of cell labels
+      - the string "hull_of_anchor"
+    """
+    if isinstance(cells_field, str) and cells_field.strip() == "hull_of_anchor":
+        expand = int(round(0.10 * min(mosaic.width, mosaic.height)))
+        poly = expand_polygon(convex_hull(anchor_polygon_px), max(expand, 0))
+        source = "convex_hull_of_anchor"
+        rationale = "LLM escape-hatch: hull around anchor"
+    elif isinstance(cells_field, list):
+        bbox = cells_to_bbox(
+            cells_field, grid_rows, grid_cols, (mosaic.width, mosaic.height),
+        )
+        if bbox is None:
+            return None
+        x, y, w, h = bbox
+        poly = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+        source = "llm_polygon"
+        rationale = ""
+    else:
+        return None
+
     clipped = clip_polygon_to_rect(
-        [(float(x), float(y)) for x, y in polygon_px],
+        [(float(x), float(y)) for x, y in poly],
         mosaic.width,
         mosaic.height,
     )
@@ -238,37 +257,10 @@ def _build_interpreted_geometry(
     return InterpretedGeometry(
         pixel_polygon=clipped,
         latlon_polygon=latlon,
-        image_ref=image_ref,
+        image_ref="mosaic",
         source=source,
         rationale=rationale,
     )
-
-
-def _resolve_influence_polygon_px(
-    influence_field: Any,
-    anchor_polygon_px: list[tuple[int, int]],
-    mosaic_width: int,
-    mosaic_height: int,
-) -> tuple[list[tuple[int, int]], str]:
-    """Normalize the LLM's influence_zone polygon field. Returns (polygon_px, source)."""
-    if isinstance(influence_field, dict) and influence_field.get("convex_hull_of_anchor"):
-        hull = convex_hull(anchor_polygon_px)
-        if "expand_frac" in influence_field:
-            expand = int(
-                round(
-                    float(influence_field["expand_frac"])
-                    * min(mosaic_width, mosaic_height),
-                ),
-            )
-        else:
-            expand = int(influence_field.get("expand_px", 100))
-        return expand_polygon(hull, max(expand, 0)), "convex_hull_of_anchor"
-    if isinstance(influence_field, list):
-        return (
-            _normalize_or_pixel_polygon(influence_field, mosaic_width, mosaic_height),
-            "llm_polygon",
-        )
-    return [], "llm_polygon"
 
 
 # --- Discovery preview image ---
@@ -277,6 +269,8 @@ def _resolve_influence_polygon_px(
 def _draw_discovery_preview(
     z16_image_path: str,
     anchors: list[dict],
+    grid_rows: int,
+    grid_cols: int,
     out_path: Path,
 ) -> None:
     from PIL import ImageDraw, ImageFont
@@ -294,13 +288,11 @@ def _draw_discovery_preview(
             font = ImageFont.load_default()
 
     for a in anchors:
-        frac = a.get("approx_bbox_frac")
-        if frac and max(float(v) for v in frac) <= 1.5:
-            x, y, w, h = [float(v) * Z16_CELL_PX for v in frac]
-        else:
-            bbox = a.get("approx_bbox_px_z16") or [0, 0, 0, 0]
-            x, y, w, h = bbox
-        x, y, w, h = int(x), int(y), int(w), int(h)
+        cells = a.get("cells") or []
+        bbox = cells_to_bbox(cells, grid_rows, grid_cols, img.size)
+        if bbox is None:
+            continue
+        x, y, w, h = bbox
         draw.rectangle([x, y, x + w, y + h], outline=(255, 215, 0), width=3)
         label = f"{a.get('anchor_id', '?')} {a.get('structure_type', '')}"
         draw.text((x + 4, y + 4), label, fill="white", font=font)
@@ -309,11 +301,17 @@ def _draw_discovery_preview(
     img.save(str(out_path))
 
 
-def _anchor_center_latlon(
-    bbox_px_z16: list[int] | tuple[int, int, int, int],
+def _anchor_center_latlon_from_cells(
+    cells: list[str],
+    grid_rows: int,
+    grid_cols: int,
     z16_center: tuple[float, float],
 ) -> tuple[float, float]:
-    x, y, w, h = bbox_px_z16
+    """Compute anchor's center lat/lon from its z16 cell list."""
+    bbox = cells_to_bbox(cells, grid_rows, grid_cols, (Z16_CELL_PX, Z16_CELL_PX))
+    if bbox is None:
+        return z16_center
+    x, y, w, h = bbox
     cx = x + w / 2.0
     cy = y + h / 2.0
     return pixel_to_latlon(
@@ -321,72 +319,62 @@ def _anchor_center_latlon(
     )
 
 
-# --- Seed validation + regenerate wrapper ---
+def _bbox_z16_from_cells(
+    cells: list[str],
+    grid_rows: int,
+    grid_cols: int,
+) -> tuple[int, int, int, int]:
+    bbox = cells_to_bbox(cells, grid_rows, grid_cols, (Z16_CELL_PX, Z16_CELL_PX))
+    if bbox is None:
+        return (0, 0, Z16_CELL_PX, Z16_CELL_PX)
+    return bbox
+
+
+# --- Identify + regenerate-once wrapper ---
 
 
 async def _identify_with_retry(
     *,
-    mosaic_image_path: str,
-    anchor: dict,
-    mosaic: Mosaic,
     identify_fn,
-    get_points_to_validate,
-    feedback_note_template: str = "",
+    fn_kwargs: dict,
+    get_features_to_validate,
     budget: StructureBudget,
 ) -> dict | None:
-    """Run an identify call; validate; on failure, retry ONCE with a feedback note.
-
-    `identify_fn(mosaic_path, anchor, feedback_note)` is either llm.identify_anchor
-    or llm.identify_subzones. `get_points_to_validate(response)` returns a list of
-    (feature_id, positives_px, negatives_px, mode) tuples to pass through the
-    validator. If ANY feature fails, we regenerate the whole call once; the second
-    attempt's per-feature failures are handled by the caller (drop).
-    Returns the second-attempt response on retry, or None if the first call
-    raises.
-    """
+    """Run identify; validate each feature's cells; regenerate once on failure."""
     budget.charge_call()
     try:
-        resp = await identify_fn(mosaic_image_path, anchor, "")
+        resp = await identify_fn(**fn_kwargs)
     except Exception as e:  # noqa: BLE001
         logger.warning("identify call failed: %s", e)
         return None
 
-    # Run validation on first-pass response.
-    issues = _collect_validation_issues(resp, mosaic, get_points_to_validate)
+    issues = _collect_cell_issues(resp, get_features_to_validate)
     if not issues:
         return resp
 
-    # Regenerate once with feedback.
     feedback = "; ".join(f"{fid}: {reason}" for fid, reason in issues)
-    if feedback_note_template:
-        feedback = feedback_note_template.format(issues=feedback)
-    logger.info("seed validation failed; regenerating once (%s)", feedback[:200])
+    logger.info("cell validation failed; regenerating once (%s)", feedback[:200])
     if budget.anchor_exhausted():
         return resp
     budget.charge_call()
+    retry_kwargs = dict(fn_kwargs)
+    retry_kwargs["feedback_note"] = feedback
     try:
-        resp2 = await identify_fn(mosaic_image_path, anchor, feedback)
+        resp2 = await identify_fn(**retry_kwargs)
     except Exception as e:  # noqa: BLE001
         logger.warning("identify regenerate failed: %s", e)
         return resp
     return resp2
 
 
-def _collect_validation_issues(
-    resp: dict,
-    mosaic: Mosaic,
-    get_points_to_validate,
-) -> list[tuple[str, str]]:
-    """Run validator on every feature; return a list of (feature_id, reason) failures."""
-    issues: list[tuple[str, str]] = []
-    excluded = default_excluded_regions((mosaic.width, mosaic.height))
-    for feature_id, pos_px, neg_px, mode in get_points_to_validate(resp, mosaic):
-        r = validate_seeds(
-            pos_px, neg_px,
-            image_size=(mosaic.width, mosaic.height),
-            extraction_mode=mode,
-            excluded_regions=excluded,
-        )
+def _collect_cell_issues(resp: dict, get_features_to_validate) -> list[tuple[str, str]]:
+    grid_rows = int(resp.get("_grid_rows", 0))
+    grid_cols = int(resp.get("_grid_cols", 0))
+    if not grid_rows or not grid_cols:
+        return []
+    issues = []
+    for feature_id, cells, mode in get_features_to_validate(resp):
+        r = validate_cells(cells, grid_rows, grid_cols, extraction_mode=mode)
         if r.verdict is not Verdict.PASS:
             issues.append((feature_id, r.reason))
     return issues
@@ -405,16 +393,13 @@ async def run_structure_phase(
     parent_context: str = "",
     coverage_miles: float = 0.37,
     budget: StructureBudget | None = None,
-    extractor_registry: dict | None = None,
+    extractor_registry: dict | None = None,  # kept for Phase 2 injection
 ) -> StructurePhaseResult:
-    """Run the full structure phase for one confirmed zoom-16 cell.
-
-    `extractor_registry` (optional) overrides the default extractor-per-mode
-    mapping. Tests and Phase 2+ use this to swap SAM in without agent changes.
-    """
+    """Run the full structure phase for one confirmed zoom-16 cell."""
     budget = budget or StructureBudget()
     paths = StructurePaths.for_cell(Path(base_output_dir), cell_id)
     paths.structures_root.mkdir(parents=True, exist_ok=True)
+    paths.grid_overlay_dir.mkdir(parents=True, exist_ok=True)
 
     result = StructurePhaseResult(cell_id=cell_id)
 
@@ -423,7 +408,8 @@ async def run_structure_phase(
     budget.charge_call()
     try:
         discovery = await llm.discover_anchors(
-            z15_image_path, z16_image_path, parent_context, cell_center, coverage_miles,
+            z15_image_path, z16_image_path, parent_context, cell_center,
+            coverage_miles, grid_out_dir=paths.grid_overlay_dir,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("[structure:%s] discovery failed: %s", cell_id, e)
@@ -437,6 +423,9 @@ async def run_structure_phase(
         (paths.structures_root / "discovery.md").write_text(
             raw_discover, encoding="utf-8",
         )
+    grid_rows_z16 = int(discovery.pop("_grid_rows", 0))
+    grid_cols_z16 = int(discovery.pop("_grid_cols", 0))
+    discovery.pop("_gridded_image_path", None)
 
     anchors_raw: list[dict] = list(discovery.get("anchors", []))
     seen_ids: set[str] = set()
@@ -447,7 +436,10 @@ async def run_structure_phase(
         a["anchor_id"] = aid
         seen_ids.add(aid)
 
-    _draw_discovery_preview(z16_image_path, anchors_raw, paths.discovery_image_path)
+    _draw_discovery_preview(
+        z16_image_path, anchors_raw, grid_rows_z16, grid_cols_z16,
+        paths.discovery_image_path,
+    )
 
     if not anchors_raw:
         logger.info("[structure:%s] no anchors discovered", cell_id)
@@ -466,17 +458,9 @@ async def run_structure_phase(
     deferred_raw = ranked[budget.max_anchors_per_cell:]
 
     for a, rank in deferred_raw:
-        frac = a.get("approx_bbox_frac")
-        if frac and max(float(v) for v in frac) <= 1.5:
-            bbox_tuple = (
-                int(round(float(frac[0]) * Z16_CELL_PX)),
-                int(round(float(frac[1]) * Z16_CELL_PX)),
-                int(round(float(frac[2]) * Z16_CELL_PX)),
-                int(round(float(frac[3]) * Z16_CELL_PX)),
-            )
-        else:
-            raw = a.get("approx_bbox_px_z16") or [0, 0, 0, 0]
-            bbox_tuple = (int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
+        bbox_tuple = _bbox_z16_from_cells(
+            a.get("cells", []), grid_rows_z16, grid_cols_z16,
+        )
         result.deferred.append(DeferredAnchor(
             anchor_id=a["anchor_id"],
             structure_type=a.get("structure_type", "other"),
@@ -488,7 +472,7 @@ async def run_structure_phase(
             rank=rank,
         ))
 
-    # --- Per-anchor processing ---
+    # --- Per-anchor ---
     mosaic_state = MosaicState()
     for a, _rank in top:
         try:
@@ -496,12 +480,13 @@ async def run_structure_phase(
                 anchor=a,
                 cell_id=cell_id,
                 cell_center=cell_center,
+                grid_rows_z16=grid_rows_z16,
+                grid_cols_z16=grid_cols_z16,
                 provider=provider,
                 paths=paths,
                 budget=budget,
                 mosaic_state=mosaic_state,
                 result=result,
-                extractor_registry=extractor_registry,
             )
         except Exception as e:  # noqa: BLE001
             logger.exception(
@@ -532,12 +517,13 @@ async def _process_anchor(
     anchor: dict,
     cell_id: str,
     cell_center: tuple[float, float],
+    grid_rows_z16: int,
+    grid_cols_z16: int,
     provider: ImageProvider,
     paths: StructurePaths,
     budget: StructureBudget,
     mosaic_state: MosaicState,
     result: StructurePhaseResult,
-    extractor_registry: dict | None,
 ) -> None:
     anchor_id: str = anchor["anchor_id"]
     anchor_dir = paths.structures_root / anchor_id
@@ -546,19 +532,11 @@ async def _process_anchor(
 
     budget.start_anchor()
 
-    # --- PLAN_CAPTURE (deterministic) ---
+    # --- PLAN_CAPTURE (deterministic, bbox from z16 cells) ---
     logger.info("[structure:%s:%s] PLAN_CAPTURE", cell_id, anchor_id)
-    bbox_frac = anchor.get("approx_bbox_frac")
-    if bbox_frac and max(float(v) for v in bbox_frac) <= 1.5:
-        bbox = (
-            int(round(float(bbox_frac[0]) * Z16_CELL_PX)),
-            int(round(float(bbox_frac[1]) * Z16_CELL_PX)),
-            int(round(float(bbox_frac[2]) * Z16_CELL_PX)),
-            int(round(float(bbox_frac[3]) * Z16_CELL_PX)),
-        )
-    else:
-        raw = anchor.get("approx_bbox_px_z16") or [0, 0, Z16_CELL_PX, Z16_CELL_PX]
-        bbox = (int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
+    bbox = _bbox_z16_from_cells(
+        anchor.get("cells", []), grid_rows_z16, grid_cols_z16,
+    )
     ce = anchor.get("continuation_edges") or {}
     plan = select_z18_centers(
         anchor_bbox_px_z16=bbox,
@@ -583,7 +561,9 @@ async def _process_anchor(
     mosaic.save(mosaic_path)
 
     # --- RESOLVE_CONTINUATION ---
-    anchor_center_latlon = _anchor_center_latlon(bbox, cell_center)
+    anchor_center_latlon = _anchor_center_latlon_from_cells(
+        anchor.get("cells", []), grid_rows_z16, grid_cols_z16, cell_center,
+    )
     expansions = 0
     while expansions < budget.continuation_loop_cap and not budget.anchor_exhausted():
         logger.info(
@@ -627,14 +607,16 @@ async def _process_anchor(
         result.truncated = True
         return
 
-    # --- IDENTIFY + VALIDATE (anchor + member seeds + influence polygon) ---
-    logger.info("[structure:%s:%s] IDENTIFY (anchor+members+influence)", cell_id, anchor_id)
+    # --- IDENTIFY + VALIDATE ---
+    logger.info("[structure:%s:%s] IDENTIFY", cell_id, anchor_id)
     identify_resp = await _identify_with_retry(
-        mosaic_image_path=str(mosaic_path),
-        anchor=anchor,
-        mosaic=mosaic,
         identify_fn=llm.identify_anchor,
-        get_points_to_validate=_anchor_response_validation_points,
+        fn_kwargs={
+            "mosaic_image_path": str(mosaic_path),
+            "anchor": anchor,
+            "grid_out_dir": paths.grid_overlay_dir / anchor_id,
+        },
+        get_features_to_validate=_anchor_response_validation_cells,
         budget=budget,
     )
     if identify_resp is None:
@@ -644,36 +626,42 @@ async def _process_anchor(
     raw = identify_resp.pop("raw_response", "")
     if raw:
         (anchor_dir / "identify.md").write_text(raw, encoding="utf-8")
+    grid_rows_m = int(identify_resp.pop("_grid_rows", 0))
+    grid_cols_m = int(identify_resp.pop("_grid_cols", 0))
+    identify_resp.pop("_gridded_image_path", None)
+
+    registry = build_gridcell_registry(grid_rows_m, grid_cols_m, (mosaic.width, mosaic.height))
 
     # --- EXTRACT anchor ---
     anchor_block = identify_resp.get("anchor") or {}
-    anchor_pos_px = _frac_points_to_px(
-        anchor_block.get("positive_points"), mosaic.width, mosaic.height,
-    )
-    anchor_neg_px = _frac_points_to_px(
-        anchor_block.get("negative_points"), mosaic.width, mosaic.height,
-    )
-    if not anchor_pos_px:
+    anchor_cells = anchor_block.get("cells") or []
+    anchor_mode = mode_for(anchor.get("structure_type", "other"), "anchor")
+    anchor_val = validate_cells(anchor_cells, grid_rows_m, grid_cols_m, anchor_mode)
+    if anchor_val.verdict is not Verdict.PASS or not anchor_val.parsed_cells:
         _fail_identification(
             result, anchor_id, "anchor",
-            "no valid positive points after validation/regeneration",
+            f"anchor cells failed validation after retry: {anchor_val.reason}",
             regeneration_attempted=True,
         )
         return
 
-    anchor_mode = mode_for(anchor.get("structure_type", "other"), "anchor")
-    anchor_extractor = get_extractor(anchor_mode, extractor_registry)
-    anchor_extract = anchor_extractor.extract(
-        mosaic.image, anchor_pos_px, anchor_neg_px, bbox_hint=None,
-    )
-    anchor_geom = _build_observed_geometry(
-        anchor_extract, anchor_mode, mosaic, anchor_pos_px, anchor_neg_px,
+    anchor_geom = _build_observed_from_cells(
+        cells=anchor_cells,
+        parsed_cells=anchor_val.parsed_cells,
+        mode=anchor_mode,
+        mosaic=mosaic,
+        registry=registry,
+        grid_rows=grid_rows_m,
+        grid_cols=grid_cols_m,
     )
     if anchor_geom is None:
         anchor_geom = _fallback_region_geometry(
-            anchor_pos_px, anchor_neg_px, mosaic, result, anchor_id, "anchor",
-            reason="primary anchor extractor returned degenerate polygon",
-            primary_extractor=anchor_extract.extractor_name,
+            anchor_val.parsed_cells, mosaic, result, anchor_id, "anchor",
+            reason="anchor gridcell polygon collapsed",
+            primary_extractor="gridcell",
+            grid_rows=grid_rows_m,
+            grid_cols=grid_cols_m,
+            cells=anchor_cells,
         )
         if anchor_geom is None:
             _fail_identification(
@@ -690,27 +678,33 @@ async def _process_anchor(
     for idx, m in enumerate(raw_members):
         m_id = f"{anchor_id}-m{idx + 1}"
         m_type = m.get("feature_type", "bar")
-        m_pos = _frac_points_to_px(
-            m.get("positive_points"), mosaic.width, mosaic.height,
-        )
-        m_neg = _frac_points_to_px(
-            m.get("negative_points"), mosaic.width, mosaic.height,
-        )
-        if not m_pos:
+        m_cells = m.get("cells") or []
+        m_mode = mode_for(m_type, "anchor")
+        mval = validate_cells(m_cells, grid_rows_m, grid_cols_m, m_mode)
+        if mval.verdict is not Verdict.PASS or not mval.parsed_cells:
             _fail_identification(
                 result, m_id, "complex_member",
-                "no positive points", regeneration_attempted=True,
+                f"member cells failed validation: {mval.reason}",
+                regeneration_attempted=True,
             )
             continue
-        m_mode = mode_for(m_type, "anchor")  # members use anchor vocabulary
-        m_extractor = get_extractor(m_mode, extractor_registry)
-        m_out = m_extractor.extract(mosaic.image, m_pos, m_neg)
-        m_geom = _build_observed_geometry(m_out, m_mode, mosaic, m_pos, m_neg)
+        m_geom = _build_observed_from_cells(
+            cells=m_cells,
+            parsed_cells=mval.parsed_cells,
+            mode=m_mode,
+            mosaic=mosaic,
+            registry=registry,
+            grid_rows=grid_rows_m,
+            grid_cols=grid_cols_m,
+        )
         if m_geom is None:
             m_geom = _fallback_region_geometry(
-                m_pos, m_neg, mosaic, result, m_id, "complex_member",
-                reason="member extractor returned degenerate polygon",
-                primary_extractor=m_out.extractor_name,
+                mval.parsed_cells, mosaic, result, m_id, "complex_member",
+                reason="member gridcell polygon collapsed",
+                primary_extractor="gridcell",
+                grid_rows=grid_rows_m,
+                grid_cols=grid_cols_m,
+                cells=m_cells,
             )
             if m_geom is None:
                 _fail_identification(
@@ -728,26 +722,19 @@ async def _process_anchor(
 
     # --- INTERPRET influence zone ---
     influence_block = identify_resp.get("influence_zone") or {}
-    raw_poly = influence_block.get("polygon", [])
-    influence_poly_px, influence_source = _resolve_influence_polygon_px(
-        raw_poly, anchor_geom.pixel_polygon, mosaic.width, mosaic.height,
-    )
-    influence_geom = _build_interpreted_geometry(
-        influence_poly_px, mosaic,
-        source=influence_source,
-        rationale=influence_block.get("rationale", ""),
+    influence_cells_field = influence_block.get("cells")
+    influence_geom = _build_interpreted_from_cells(
+        influence_cells_field, anchor_geom.pixel_polygon, mosaic,
+        grid_rows_m, grid_cols_m,
     )
     if influence_geom is None:
-        expand_default = int(round(0.10 * min(mosaic.width, mosaic.height)))
-        fallback_poly = expand_polygon(
-            convex_hull(anchor_geom.pixel_polygon), expand_default,
+        # LLM influence polygon collapsed; fall back to the hull-of-anchor path.
+        influence_geom = _build_interpreted_from_cells(
+            "hull_of_anchor", anchor_geom.pixel_polygon, mosaic,
+            grid_rows_m, grid_cols_m,
         )
-        influence_geom = _build_interpreted_geometry(
-            fallback_poly, mosaic, source="convex_hull_of_anchor",
-            rationale="orchestrator fallback: LLM polygon collapsed",
-        )
-    # influence_geom should now be non-None; keep a defensive guard.
     if influence_geom is None:
+        # Last resort: a trivial box around the anchor polygon
         _fail_identification(
             result, anchor_id, "anchor",
             "influence polygon collapsed and hull fallback also failed",
@@ -758,21 +745,28 @@ async def _process_anchor(
     # --- IDENTIFY_SUBZONES + VALIDATE + EXTRACT ---
     subzones_out: list[FishableSubzone] = []
     if not budget.anchor_exhausted():
-        logger.info(
-            "[structure:%s:%s] IDENTIFY_SUBZONES", cell_id, anchor_id,
-        )
+        logger.info("[structure:%s:%s] IDENTIFY_SUBZONES", cell_id, anchor_id)
         subzone_resp = await _identify_with_retry(
-            mosaic_image_path=str(mosaic_path),
-            anchor=anchor,
-            mosaic=mosaic,
             identify_fn=llm.identify_subzones,
-            get_points_to_validate=_subzone_response_validation_points,
+            fn_kwargs={
+                "mosaic_image_path": str(mosaic_path),
+                "anchor": anchor,
+                "grid_out_dir": paths.grid_overlay_dir / anchor_id,
+            },
+            get_features_to_validate=_subzone_response_validation_cells,
             budget=budget,
         )
         if subzone_resp is not None:
             raw_sz = subzone_resp.pop("raw_response", "")
             if raw_sz:
                 (anchor_dir / "subzones.md").write_text(raw_sz, encoding="utf-8")
+            grid_rows_s = int(subzone_resp.pop("_grid_rows", grid_rows_m))
+            grid_cols_s = int(subzone_resp.pop("_grid_cols", grid_cols_m))
+            subzone_resp.pop("_gridded_image_path", None)
+            sz_registry = build_gridcell_registry(
+                grid_rows_s, grid_cols_s, (mosaic.width, mosaic.height),
+            )
+
             for sz in (subzone_resp.get("subzones") or [])[:4]:
                 sz_id = sz.get("subzone_id") or f"{anchor_id}-s{len(subzones_out) + 1}"
                 sz_type = sz.get("subzone_type", "other")
@@ -783,29 +777,33 @@ async def _process_anchor(
                         regeneration_attempted=False,
                     )
                     continue
-                sz_pos = _frac_points_to_px(
-                    sz.get("positive_points"), mosaic.width, mosaic.height,
-                )
-                sz_neg = _frac_points_to_px(
-                    sz.get("negative_points"), mosaic.width, mosaic.height,
-                )
-                if not sz_pos:
+                sz_cells = sz.get("cells") or []
+                sz_mode = mode_for(sz_type, "subzone")
+                szval = validate_cells(sz_cells, grid_rows_s, grid_cols_s, sz_mode)
+                if szval.verdict is not Verdict.PASS or not szval.parsed_cells:
                     _fail_identification(
                         result, sz_id, "subzone",
-                        "no positive points", regeneration_attempted=True,
+                        f"subzone cells failed validation: {szval.reason}",
+                        regeneration_attempted=True,
                     )
                     continue
-                sz_mode = mode_for(sz_type, "subzone")
-                sz_extractor = get_extractor(sz_mode, extractor_registry)
-                sz_out = sz_extractor.extract(mosaic.image, sz_pos, sz_neg)
-                sz_geom = _build_observed_geometry(
-                    sz_out, sz_mode, mosaic, sz_pos, sz_neg,
+                sz_geom = _build_observed_from_cells(
+                    cells=sz_cells,
+                    parsed_cells=szval.parsed_cells,
+                    mode=sz_mode,
+                    mosaic=mosaic,
+                    registry=sz_registry,
+                    grid_rows=grid_rows_s,
+                    grid_cols=grid_cols_s,
                 )
                 if sz_geom is None:
                     sz_geom = _fallback_region_geometry(
-                        sz_pos, sz_neg, mosaic, result, sz_id, "subzone",
-                        reason="subzone extractor returned degenerate polygon",
-                        primary_extractor=sz_out.extractor_name,
+                        szval.parsed_cells, mosaic, result, sz_id, "subzone",
+                        reason="subzone gridcell polygon collapsed",
+                        primary_extractor="gridcell",
+                        grid_rows=grid_rows_s,
+                        grid_cols=grid_cols_s,
+                        cells=sz_cells,
                     )
                     if sz_geom is None:
                         continue
@@ -828,8 +826,7 @@ async def _process_anchor(
         scale=anchor.get("scale", "minor"),
         anchor_center_latlon=anchor_center_latlon,
         geometry=anchor_geom,
-        orientation_deg=float(anchor["orientation_deg"])
-            if anchor.get("orientation_deg") is not None else None,
+        orientation_deg=None,
         confidence=_clamp(float(anchor.get("confidence", 0.0)), 0.0, 1.0),
         rationale=anchor.get("rationale", ""),
         source_images_used=[str(mosaic_path)],
@@ -839,7 +836,7 @@ async def _process_anchor(
         anchor_id=anchor_id,
         members=member_features,
         relationship_summary=complex_block.get("relationship_summary", ""),
-        envelope=None,  # Phase 1: no envelope. Phase 3 can derive one.
+        envelope=None,
     )
     influence_obj = InfluenceZone(
         influence_zone_id=f"{anchor_id}-influence",
@@ -868,11 +865,10 @@ async def _process_anchor(
     subzone_polys = [
         (sz.subzone_id, list(sz.geometry.pixel_polygon)) for sz in subzones_out
     ]
-
-    annotated_path = anchor_dir / "annotated.png"
     all_seed_points = _collect_all_seed_points(
         anchor_geom, member_features, subzones_out,
     )
+    annotated_path = anchor_dir / "annotated.png"
     render_annotated(
         base_image=mosaic.image,
         out_path=annotated_path,
@@ -896,71 +892,56 @@ async def _process_anchor(
     )
 
 
-# --- Validation-point extractors (per response schema) ---
+# --- Response → (feature_id, cells, mode) iterators for validation ---
 
 
-def _anchor_response_validation_points(resp: dict, mosaic: Mosaic):
-    """Yield (feature_id, positives_px, negatives_px, mode) for every feature in
-    an identify_anchor response."""
-    anchor_block = resp.get("anchor") or {}
-    pos = _frac_points_to_px(
-        anchor_block.get("positive_points"), mosaic.width, mosaic.height,
-    )
-    neg = _frac_points_to_px(
-        anchor_block.get("negative_points"), mosaic.width, mosaic.height,
-    )
-    # Anchor mode depends on structure_type but we don't have it here; the agent
-    # uses "region" as the validation mode (most permissive min-positives=1).
-    yield ("anchor", pos, neg, "region")
+def _anchor_response_validation_cells(resp: dict):
+    anchor = resp.get("anchor") or {}
+    yield ("anchor", anchor.get("cells", []), "region")
 
     for idx, m in enumerate((resp.get("local_complex") or {}).get("members") or []):
-        mpos = _frac_points_to_px(
-            m.get("positive_points"), mosaic.width, mosaic.height,
-        )
-        mneg = _frac_points_to_px(
-            m.get("negative_points"), mosaic.width, mosaic.height,
-        )
         m_type = m.get("feature_type", "bar")
-        mmode = mode_for(m_type, "anchor")
-        yield (f"member_{idx + 1}", mpos, mneg, mmode)
+        m_mode = mode_for(m_type, "anchor")
+        yield (f"member_{idx + 1}", m.get("cells", []), m_mode)
 
 
-def _subzone_response_validation_points(resp: dict, mosaic: Mosaic):
+def _subzone_response_validation_cells(resp: dict):
     for sz in resp.get("subzones") or []:
         sz_type = sz.get("subzone_type", "other")
-        pos = _frac_points_to_px(
-            sz.get("positive_points"), mosaic.width, mosaic.height,
-        )
-        neg = _frac_points_to_px(
-            sz.get("negative_points"), mosaic.width, mosaic.height,
-        )
         mode = mode_for(sz_type, "subzone")
-        yield (sz.get("subzone_id", sz_type), pos, neg, mode)
+        yield (sz.get("subzone_id", sz_type), sz.get("cells", []), mode)
 
 
 # --- Fallbacks + logging ---
 
 
 def _fallback_region_geometry(
-    positives: list[tuple[int, int]],
-    negatives: list[tuple[int, int]],
+    parsed_cells: list[tuple[int, int]],
     mosaic: Mosaic,
     result: StructurePhaseResult,
     feature_id: str,
     feature_level: str,
     reason: str,
     primary_extractor: str,
+    grid_rows: int,
+    grid_cols: int,
+    cells: list[str],
 ) -> ObservedGeometry | None:
-    """Use a raw ClickBoxExtractor(region) and tag it as a fallback."""
-    fallback_extractor = ClickBoxExtractor(mode="region")
-    out = fallback_extractor.extract(mosaic.image, positives, negatives)
-    geom = _build_observed_geometry(
-        out, "region", mosaic, positives, negatives,
+    """Fall back to ClickBoxExtractor(region) seeded by cell centroids."""
+    centroids = cells_to_centroids(
+        cells, grid_rows, grid_cols, (mosaic.width, mosaic.height),
     )
-    if geom is None:
+    if not centroids:
         return None
-    # Overwrite the extractor name to make the fallback visible in artifacts.
-    geom.extractor = "fallback"
+    fb = ClickBoxExtractor(mode="region")
+    out = fb.extract(mosaic.image, centroids, [])
+    clipped = clip_polygon_to_rect(
+        [(float(x), float(y)) for x, y in out.pixel_polygon],
+        mosaic.width, mosaic.height,
+    )
+    if len(clipped) < 3:
+        return None
+    latlon = mosaic.polygon_px_to_latlon(clipped)
     result.segmentation_issues.append(SegmentationIssue(
         feature_id=feature_id,
         feature_level=feature_level,
@@ -968,7 +949,19 @@ def _fallback_region_geometry(
         fallback_used="clickbox_region",
         reason=reason,
     ))
-    return geom
+    return ObservedGeometry(
+        pixel_polygon=clipped,
+        latlon_polygon=latlon,
+        image_ref="mosaic",
+        extractor="fallback",
+        extraction_mode="region",
+        seed_cells=list(cells),
+        grid_rows=grid_rows or None,
+        grid_cols=grid_cols or None,
+        seed_positive_points=centroids,
+        seed_negative_points=[],
+        confidence=None,
+    )
 
 
 def _fail_identification(
@@ -991,21 +984,20 @@ def _collect_all_seed_points(
     members: list[MemberFeature],
     subzones: list[FishableSubzone],
 ) -> list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]]:
-    """Gather (label, positives, negatives) triples for rendering."""
     out: list[tuple[str, list[tuple[int, int]], list[tuple[int, int]]]] = [
-        ("anchor", anchor_geom.seed_positive_points, anchor_geom.seed_negative_points),
+        ("anchor", list(anchor_geom.seed_positive_points), list(anchor_geom.seed_negative_points)),
     ]
     for m in members:
         out.append((
             m.name,
-            m.geometry.seed_positive_points,
-            m.geometry.seed_negative_points,
+            list(m.geometry.seed_positive_points),
+            list(m.geometry.seed_negative_points),
         ))
     for sz in subzones:
         out.append((
             sz.subzone_id,
-            sz.geometry.seed_positive_points,
-            sz.geometry.seed_negative_points,
+            list(sz.geometry.seed_positive_points),
+            list(sz.geometry.seed_negative_points),
         ))
     return out
 

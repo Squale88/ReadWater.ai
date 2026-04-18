@@ -1,15 +1,16 @@
-"""Thin Claude-vision wrappers for the structure-phase prompts.
+"""Claude-vision wrappers for the structure-phase prompts (grid-cell edition).
 
-Phase 1 prompts:
+Phase 1.5 prompts:
   discover_anchors      — at cell level, enumerate candidate anchors with
-                          rough normalized bboxes and continuation edges
+                          grid cells and continuation edges
   resolve_continuation  — on a mosaic, decide whether to expand tiles
-  identify_anchor       — click points + influence polygon for one anchor
-  identify_subzones     — click points for up to 4 subzones
+  identify_anchor       — anchor cells + member cells + influence cells
+  identify_subzones     — cells per subzone (v1 whitelist)
 
-Every wrapper returns the parsed JSON plus raw_response text. Coordinates
-come back as normalized fractions [0, 1] of the image Claude saw, except
-resolve_continuation which returns only edge booleans.
+The discovery and identify wrappers here render a grid overlay on the image
+(using pipeline.structure.grid_overlay) BEFORE sending to Claude, so the
+image Claude sees always has labeled cells to read. The raw image path is
+kept around in the agent for rendering the annotated output.
 """
 
 from __future__ import annotations
@@ -27,28 +28,33 @@ from readwater.api.claude_vision import (
     _get_client,
     _load_prompt,
 )
+from readwater.pipeline.structure.grid_overlay import (
+    draw_label_grid,
+    grid_shape_for_image,
+    row_label,
+)
 
 _MAX_UPLOAD_BYTES = 5 * 1024 * 1024 - 64 * 1024
 _UPLOAD_JPEG_QUALITY = 85
 _UPLOAD_MAX_DIM = 1800
 
+# Grid sizing knobs. 8 divisions on the short axis keeps cells large enough
+# for Claude to label reliably (from POC) while still being fine enough at
+# z18 (~55 m per cell) for fishing-spot scale.
+DEFAULT_DISCOVER_SHORT = 8
+DEFAULT_IDENTIFY_SHORT = 8
+
 
 def _image_block(path: str | Path) -> dict:
-    """Re-encode an image as JPEG (with optional downscale) for Claude upload.
-
-    Stays under Anthropic's 5 MB base64 cap by resizing or dropping quality
-    as needed.
-    """
+    """JPEG-encode with resize-if-too-large for Claude upload."""
     img = Image.open(path)
     if img.mode != "RGB":
         img = img.convert("RGB")
-
     longest = max(img.size)
     if longest > _UPLOAD_MAX_DIM:
         ratio = _UPLOAD_MAX_DIM / longest
         new_size = (int(round(img.size[0] * ratio)), int(round(img.size[1] * ratio)))
         img = img.resize(new_size, Image.LANCZOS)
-
     quality = _UPLOAD_JPEG_QUALITY
     data = b""
     for _ in range(4):
@@ -63,7 +69,6 @@ def _image_block(path: str | Path) -> dict:
             img = img.resize(
                 (int(img.size[0] * 0.85), int(img.size[1] * 0.85)), Image.LANCZOS,
             )
-
     return {
         "type": "image",
         "source": {
@@ -72,6 +77,20 @@ def _image_block(path: str | Path) -> dict:
             "data": base64.b64encode(data).decode("utf-8"),
         },
     }
+
+
+def _gridded_image_path(
+    src_image_path: str,
+    short_axis_cells: int,
+    out_dir: str | Path,
+    suffix: str,
+) -> tuple[str, int, int]:
+    """Draw a grid overlay on src image; return (gridded_path, rows, cols)."""
+    img = Image.open(src_image_path)
+    rows, cols = grid_shape_for_image(img.size, short_axis_cells=short_axis_cells)
+    out = Path(out_dir) / f"{Path(src_image_path).stem}__grid{rows}x{cols}_{suffix}.png"
+    draw_label_grid(src_image_path, rows, cols, str(out))
+    return (str(out), rows, cols)
 
 
 # --- DISCOVER ---
@@ -83,11 +102,17 @@ async def discover_anchors(
     parent_context: str,
     center: tuple[float, float],
     coverage_miles: float,
+    grid_out_dir: str | Path,
+    short_axis_cells: int = DEFAULT_DISCOVER_SHORT,
 ) -> dict:
-    """DISCOVER: look at parent+cell images, list anchor candidates."""
+    """DISCOVER: parent z15 + gridded z16 → anchor candidates with cell lists."""
     client = _get_client()
     system_prompt = _load_prompt("discover_anchors_system.txt")
     user_template = _load_prompt("discover_anchors_user.txt")
+
+    gridded_z16, rows, cols = _gridded_image_path(
+        z16_image_path, short_axis_cells, grid_out_dir, "discover",
+    )
 
     context_line = ""
     if parent_context:
@@ -98,6 +123,9 @@ async def discover_anchors(
         center_lat=f"{center[0]:.4f}",
         center_lon=f"{center[1]:.4f}",
         coverage_miles=f"{coverage_miles:.2f}",
+        grid_rows=rows,
+        grid_cols=cols,
+        last_row=row_label(rows - 1),
     )
 
     response = await client.messages.create(
@@ -109,7 +137,7 @@ async def discover_anchors(
                 "role": "user",
                 "content": [
                     _image_block(z15_image_path),
-                    _image_block(z16_image_path),
+                    _image_block(gridded_z16),
                     {"type": "text", "text": user_prompt},
                 ],
             }
@@ -118,6 +146,9 @@ async def discover_anchors(
     raw_text = response.content[0].text
     parsed = _extract_json_from_response(raw_text)
     parsed["raw_response"] = raw_text
+    parsed["_grid_rows"] = rows
+    parsed["_grid_cols"] = cols
+    parsed["_gridded_image_path"] = gridded_z16
     return parsed
 
 
@@ -176,36 +207,38 @@ async def resolve_continuation(
     return parsed
 
 
-# --- IDENTIFY_ANCHOR (seeds + members + influence polygon) ---
+# --- IDENTIFY_ANCHOR ---
 
 
 async def identify_anchor(
     mosaic_image_path: str,
     anchor: dict,
+    grid_out_dir: str | Path,
+    short_axis_cells: int = DEFAULT_IDENTIFY_SHORT,
     feedback_note: str = "",
 ) -> dict:
-    """IDENTIFY_ANCHOR: click points for the anchor and its complex members,
-    plus the influence-zone polygon.
-
-    `feedback_note` is appended to the user prompt when the validator has
-    rejected an earlier attempt and we're asking for a regeneration. It
-    describes the specific seed issue to correct.
-    """
+    """IDENTIFY_ANCHOR: gridded mosaic → anchor/member/influence cell lists."""
     client = _get_client()
     system_prompt = _load_prompt("identify_anchor_system.txt")
     user_template = _load_prompt("identify_anchor_user.txt")
+
+    gridded_mosaic, rows, cols = _gridded_image_path(
+        mosaic_image_path, short_axis_cells, grid_out_dir, "identify",
+    )
 
     user_prompt = user_template.format(
         anchor_id=anchor.get("anchor_id", "a1"),
         structure_type=anchor.get("structure_type", "unknown"),
         scale=anchor.get("scale", "minor"),
         rationale=anchor.get("rationale", ""),
+        grid_rows=rows,
+        grid_cols=cols,
+        last_row=row_label(rows - 1),
     )
     if feedback_note:
-        user_prompt = (
-            user_prompt
-            + "\n\nNOTE: a previous attempt at these seeds failed validation. "
-            + f"Issue: {feedback_note}. Please correct it in this response.\n"
+        user_prompt += (
+            f"\n\nNOTE: a previous attempt at these cells failed validation. "
+            f"Issue: {feedback_note}. Please correct it in this response.\n"
         )
 
     response = await client.messages.create(
@@ -216,7 +249,7 @@ async def identify_anchor(
             {
                 "role": "user",
                 "content": [
-                    _image_block(mosaic_image_path),
+                    _image_block(gridded_mosaic),
                     {"type": "text", "text": user_prompt},
                 ],
             }
@@ -225,36 +258,44 @@ async def identify_anchor(
     raw_text = response.content[0].text
     parsed = _extract_json_from_response(raw_text)
     parsed["raw_response"] = raw_text
+    parsed["_grid_rows"] = rows
+    parsed["_grid_cols"] = cols
+    parsed["_gridded_image_path"] = gridded_mosaic
     return parsed
 
 
-# --- IDENTIFY_SUBZONES (seeds for subzones only) ---
+# --- IDENTIFY_SUBZONES ---
 
 
 async def identify_subzones(
     mosaic_image_path: str,
     anchor: dict,
+    grid_out_dir: str | Path,
+    short_axis_cells: int = DEFAULT_IDENTIFY_SHORT,
     feedback_note: str = "",
 ) -> dict:
-    """IDENTIFY_SUBZONES: click points per subzone, constrained to v1 whitelist.
-
-    Like identify_anchor, accepts an optional feedback_note for regeneration.
-    """
+    """IDENTIFY_SUBZONES: gridded mosaic → cell lists per subzone (v1 whitelist)."""
     client = _get_client()
     system_prompt = _load_prompt("identify_subzones_system.txt")
     user_template = _load_prompt("identify_subzones_user.txt")
+
+    gridded_mosaic, rows, cols = _gridded_image_path(
+        mosaic_image_path, short_axis_cells, grid_out_dir, "subzones",
+    )
 
     user_prompt = user_template.format(
         anchor_id=anchor.get("anchor_id", "a1"),
         structure_type=anchor.get("structure_type", "unknown"),
         scale=anchor.get("scale", "minor"),
         rationale=anchor.get("rationale", ""),
+        grid_rows=rows,
+        grid_cols=cols,
+        last_row=row_label(rows - 1),
     )
     if feedback_note:
-        user_prompt = (
-            user_prompt
-            + "\n\nNOTE: a previous attempt at these seeds failed validation. "
-            + f"Issue: {feedback_note}. Please correct it in this response.\n"
+        user_prompt += (
+            f"\n\nNOTE: a previous attempt at these cells failed validation. "
+            f"Issue: {feedback_note}. Please correct it in this response.\n"
         )
 
     response = await client.messages.create(
@@ -265,7 +306,7 @@ async def identify_subzones(
             {
                 "role": "user",
                 "content": [
-                    _image_block(mosaic_image_path),
+                    _image_block(gridded_mosaic),
                     {"type": "text", "text": user_prompt},
                 ],
             }
@@ -274,4 +315,7 @@ async def identify_subzones(
     raw_text = response.content[0].text
     parsed = _extract_json_from_response(raw_text)
     parsed["raw_response"] = raw_text
+    parsed["_grid_rows"] = rows
+    parsed["_grid_cols"] = cols
+    parsed["_gridded_image_path"] = gridded_mosaic
     return parsed

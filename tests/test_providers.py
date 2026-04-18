@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from readwater.api.providers.base import ImageProvider
 from readwater.api.providers.google_static import GoogleStaticProvider
 from readwater.api.providers.placeholder import PlaceholderProvider, _make_solid_png
 from readwater.api.providers.registry import ImageProviderRegistry
