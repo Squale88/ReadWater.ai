@@ -19,12 +19,13 @@ from readwater.api.claude_vision import (
     MODEL,
     _cell_number_to_row_col,
     analyze_grid_image,
-    analyze_structure_image,
     confirm_fishing_water,
 )
 from readwater.api.providers.registry import ImageProviderRegistry
 from readwater.models.cell import BoundingBox, Cell, CellAnalysis, CellScore
 from readwater.pipeline.image_processing import draw_grid_overlay
+from readwater.pipeline.structure import run_structure_phase
+from readwater.pipeline.structure.agent import StructureBudget
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,9 @@ logger = logging.getLogger(__name__)
 MILES_PER_DEG_LAT = 69.0
 EARTH_CIRCUMFERENCE_MILES = 24901.0
 SECTIONS = 4
-TERMINAL_ZOOM = 18
+TERMINAL_ZOOM = 16  # structure phase owns zoom 18 and below
+STRUCTURE_PHASE_ZOOM = 16
+Z15_CONTEXT_PROVIDER_ROLE = "overview"
 VALID_START_ZOOMS = {10, 12}
 
 
@@ -139,7 +142,12 @@ def _image_filename(cell_id: str, depth: int, provider_name: str | None = None) 
 
 
 def _role_for_zoom(zoom: int) -> str:
-    """Determine the provider role for a given Google Maps zoom level."""
+    """Determine the provider role for a given Google Maps zoom level.
+
+    Zoom 16 uses structure-role providers (NAIP etc. where available); zooms
+    above 16 are owned by the structure phase itself and fetched via the same
+    structure provider.
+    """
     if zoom >= 16:
         return "structure"
     return "overview"
@@ -160,6 +168,7 @@ class _RunState:
     registry: ImageProviderRegistry | None = None
     threshold: float = 4.0
     start_zoom: int = 10
+    structure_budget: StructureBudget = field(default_factory=StructureBudget)
 
 
 def _save_metadata(state: _RunState) -> None:
@@ -186,6 +195,7 @@ async def analyze_cell(
     dry_run: bool = False,
     area_name: str = "default",
     output_dir: str | None = None,
+    structure_budget: StructureBudget | None = None,
 ) -> list[Cell]:
     """Recursively analyze a geographic cell via satellite imagery.
 
@@ -220,6 +230,7 @@ async def analyze_cell(
         registry=registry,
         threshold=threshold,
         start_zoom=start_zoom,
+        structure_budget=structure_budget or StructureBudget(),
     )
 
     cells = await _analyze_recursive(
@@ -314,13 +325,12 @@ async def _analyze_recursive(
         )
     else:
         first_image = next(iter(provider_images.values()))
-        next_zoom_check = zoom + 2
-        is_terminal = zoom == TERMINAL_ZOOM
+        is_structure_phase_cell = zoom == STRUCTURE_PHASE_ZOOM
 
         # --- Confirmation gate (depth > 0 only) ---
         # Parent's grid scoring flagged this cell. Before spending an API call
         # on grid analysis, confirm there's actually fishing water here.
-        if depth > 0 and not is_terminal:
+        if depth > 0:
             confirm_result = await confirm_fishing_water(
                 first_image, parent_context, center, size_miles,
             )
@@ -361,61 +371,84 @@ async def _analyze_recursive(
                 })
                 return [cell]
 
-        if is_terminal:
-            vision_result = await analyze_structure_image(
-                first_image, parent_context, center, size_miles,
+        # --- Grid scoring (all non-rejected cells) ---
+        grid_path = draw_grid_overlay(first_image)
+        try:
+            vision_result = await analyze_grid_image(
+                grid_path, parent_context, zoom, center, size_miles,
             )
-            # Save raw response as markdown
             raw_response = vision_result.pop("raw_response", "")
             if raw_response:
-                md_path = Path(first_image).with_suffix(".md")
+                md_path = Path(grid_path).with_suffix(".md")
                 md_path.write_text(raw_response, encoding="utf-8")
+            scored_cells = []
+            for sc in vision_result.get("sub_scores", []):
+                row, col = _cell_number_to_row_col(sc["cell_number"])
+                scored_cells.append(CellScore(
+                    row=row,
+                    col=col,
+                    score=float(sc["score"]),
+                    summary=sc.get("reasoning", ""),
+                    center=sub_cells_map.get((row, col), center),
+                ))
             analysis = CellAnalysis(
                 overall_summary=vision_result.get("summary", ""),
-                sub_scores=[
-                    CellScore(row=r, col=c, score=5.0, summary="Terminal cell", center=ctr)
-                    for r, c, ctr in sub_cells_geo
-                ],
-                structure_analysis=vision_result,
+                sub_scores=scored_cells,
+                hydrology_notes=vision_result.get("hydrology_notes", ""),
                 model_used=MODEL,
             )
-        else:
-            grid_path = draw_grid_overlay(first_image)
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning("Grid analysis failed for cell %s: %s", cell_id, e)
+            analysis = CellAnalysis(
+                overall_summary=f"Analysis failed: {e}",
+                sub_scores=[
+                    CellScore(row=r, col=c, score=0.0, summary="Analysis error", center=ctr)
+                    for r, c, ctr in sub_cells_geo
+                ],
+                model_used=MODEL,
+            )
+
+        # --- Structure phase at zoom 16 (replaces old zoom-18 terminal) ---
+        if is_structure_phase_cell and state.registry is not None:
             try:
-                vision_result = await analyze_grid_image(
-                    grid_path, parent_context, zoom, center, size_miles,
+                z15_provider = state.registry.get_default_provider(Z15_CONTEXT_PROVIDER_ROLE)
+                z15_path = str(
+                    state.output_dir / _image_filename(cell_id, depth, "z15ctx")
                 )
-                # Save raw response as markdown alongside grid image
-                raw_response = vision_result.pop("raw_response", "")
-                if raw_response:
-                    md_path = Path(grid_path).with_suffix(".md")
-                    md_path.write_text(raw_response, encoding="utf-8")
-                scored_cells = []
-                for sc in vision_result.get("sub_scores", []):
-                    row, col = _cell_number_to_row_col(sc["cell_number"])
-                    scored_cells.append(CellScore(
-                        row=row,
-                        col=col,
-                        score=float(sc["score"]),
-                        summary=sc.get("reasoning", ""),
-                        center=sub_cells_map.get((row, col), center),
-                    ))
-                analysis = CellAnalysis(
-                    overall_summary=vision_result.get("summary", ""),
-                    sub_scores=scored_cells,
-                    hydrology_notes=vision_result.get("hydrology_notes", ""),
-                    model_used=MODEL,
-                )
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                logger.warning("Grid analysis failed for cell %s: %s", cell_id, e)
-                analysis = CellAnalysis(
-                    overall_summary=f"Analysis failed: {e}",
-                    sub_scores=[
-                        CellScore(row=r, col=c, score=0.0, summary="Analysis error", center=ctr)
-                        for r, c, ctr in sub_cells_geo
-                    ],
-                    model_used=MODEL,
-                )
+                if state.api_calls >= state.max_api_calls:
+                    logger.warning(
+                        "API limit reached before zoom-15 context fetch for %s", cell_id,
+                    )
+                else:
+                    await asyncio.sleep(0.5)
+                    await z15_provider.fetch(center, 15, z15_path)
+                    state.api_calls += 1
+
+                    structure_provider = state.registry.get_providers("structure")[0]
+                    structure_result = await run_structure_phase(
+                        cell_id=cell_id,
+                        cell_center=center,
+                        z15_image_path=z15_path,
+                        z16_image_path=first_image,
+                        provider=structure_provider,
+                        base_output_dir=state.output_dir,
+                        parent_context=parent_context,
+                        coverage_miles=size_miles,
+                        budget=state.structure_budget,
+                    )
+                    state.api_calls += structure_result.api_calls_used
+                    analysis.structures = list(structure_result.anchors)
+                    analysis.structure_analysis = {
+                        "anchors": [a.model_dump() for a in structure_result.anchors],
+                        "complexes": [c.model_dump() for c in structure_result.complexes],
+                        "influences": [i.model_dump() for i in structure_result.influences],
+                        "subzones": [s.model_dump() for s in structure_result.subzones],
+                        "deferred": [d.model_dump() for d in structure_result.deferred],
+                        "registry_path": structure_result.registry_path,
+                        "truncated": structure_result.truncated,
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Structure phase failed for cell %s: %s", cell_id, exc)
 
     first_image = next(iter(provider_images.values()), None)
     cell = Cell(
@@ -432,7 +465,7 @@ async def _analyze_recursive(
     )
 
     # --- Record metadata ---
-    state.metadata.append({
+    meta_entry: dict = {
         "cell_id": cell_id,
         "center": list(center),
         "bbox": {
@@ -445,11 +478,24 @@ async def _analyze_recursive(
         "size_miles": size_miles,
         "provider_images": dict(provider_images),
         "providers": list(provider_images.keys()),
-    })
+    }
+    if analysis.structures:
+        meta_entry["structures_summary"] = [
+            {
+                "anchor_id": a.anchor_id,
+                "structure_type": a.structure_type,
+                "scale": a.scale,
+                "confidence": a.confidence,
+            }
+            for a in analysis.structures
+        ]
+    state.metadata.append(meta_entry)
 
     all_cells = [cell]
 
     # --- Recurse into sub-cells above threshold ---
+    # Structure-phase cells (zoom 16) own their own deeper investigation; do
+    # not descend to zoom 18 through the recursive path.
     next_zoom = zoom + 2
     if depth < max_depth and next_zoom <= TERMINAL_ZOOM:
         for sub_score in analysis.sub_scores:

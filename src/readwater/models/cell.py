@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from readwater.models.structure import AnchorStructure
+
 
 class BoundingBox(BaseModel):
     """Geographic bounding box defined by corner coordinates."""
@@ -44,6 +46,10 @@ class CellAnalysis(BaseModel):
     structure_analysis: dict = Field(
         default_factory=dict,
         description="Full structure breakdown for terminal-level (zoom 18) cells",
+    )
+    structures: list[AnchorStructure] = Field(
+        default_factory=list,
+        description="Typed anchor structures produced by the structure-phase agent",
     )
     model_used: str = Field(default="claude-sonnet-4-20250514")
     prompt_tokens: int = Field(default=0)

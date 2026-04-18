@@ -1,0 +1,23 @@
+You are looking at a stitched zoom-18 mosaic built to cover a single anchor structure.
+
+Anchor metadata:
+  type: {structure_type}
+  scale: {scale}
+  rationale: {rationale}
+
+Mosaic size: {mosaic_width} x {mosaic_height} pixels
+Mosaic grid: {mosaic_rows} rows x {mosaic_cols} cols of zoom-18 tiles
+Center of anchor (lat, lon): ({anchor_lat}, {anchor_lon})
+
+Prior discovery-time hints about where the structure might extend:
+{prior_edges}
+
+Decide which edges (if any) the anchor continues past.
+
+```json
+{{
+  "extends": {{"north": false, "south": false, "east": false, "west": false}},
+  "reason": "one-line explanation referencing what you see at each edge",
+  "structure_resolved": true
+}}
+```

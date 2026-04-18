@@ -12,12 +12,18 @@ import pytest
 
 from readwater.api.providers.placeholder import PlaceholderProvider
 from readwater.api.providers.registry import ImageProviderRegistry
+from readwater.models.structure import StructurePhaseResult
 from readwater.pipeline.cell_analyzer import (
     _image_filename,
     analyze_cell,
     ground_coverage_miles,
 )
 from readwater.pipeline.image_processing import draw_grid_overlay
+
+
+def _placeholder_structure_phase_result(cell_id: str = "test-cell") -> StructurePhaseResult:
+    """Empty structure-phase result — the pipeline tests don't exercise the agent itself."""
+    return StructurePhaseResult(cell_id=cell_id)
 
 MARCO = (25.94, -81.73)
 MARCO_LAT = 25.94
@@ -78,9 +84,9 @@ def fast_registry(registry):
             return_value=_placeholder_grid_result(),
         ),
         patch(
-            "readwater.pipeline.cell_analyzer.analyze_structure_image",
+            "readwater.pipeline.cell_analyzer.run_structure_phase",
             new_callable=AsyncMock,
-            return_value=_placeholder_structure_result(),
+            return_value=_placeholder_structure_phase_result(),
         ),
         patch(
             "readwater.pipeline.cell_analyzer.confirm_fishing_water",
@@ -166,11 +172,13 @@ async def test_dry_run_start_zoom_12(registry):
 
 
 async def test_dry_run_zoom_12_depth_3_terminal(registry):
-    """start_zoom=12, max_depth=3: chain 12->14->16->18. Zoom 18 is terminal."""
+    """start_zoom=12, max_depth=3: chain 12->14->16. Zoom 16 is terminal now (zoom 18 is owned by the structure phase, not the recursion)."""
     cells = await analyze_cell(MARCO, registry, start_zoom=12, max_depth=3, dry_run=True)
     zoom_18_cells = [c for c in cells if c.zoom_level == 18]
-    assert len(zoom_18_cells) > 0
-    for c in zoom_18_cells:
+    assert len(zoom_18_cells) == 0
+    zoom_16_cells = [c for c in cells if c.zoom_level == 16]
+    assert len(zoom_16_cells) > 0
+    for c in zoom_16_cells:
         assert c.children_ids == []
 
 
@@ -327,7 +335,7 @@ def _vision_patches():
     return (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
         patch("readwater.pipeline.cell_analyzer.analyze_grid_image", new_callable=AsyncMock, return_value=_placeholder_grid_result()),
-        patch("readwater.pipeline.cell_analyzer.analyze_structure_image", new_callable=AsyncMock, return_value=_placeholder_structure_result()),
+        patch("readwater.pipeline.cell_analyzer.run_structure_phase", new_callable=AsyncMock, return_value=_placeholder_structure_phase_result()),
         patch("readwater.pipeline.cell_analyzer.confirm_fishing_water", new_callable=AsyncMock, return_value=_placeholder_confirm_result()),
         patch("readwater.pipeline.cell_analyzer.draw_grid_overlay", side_effect=lambda p, **kw: p),
     )
@@ -347,7 +355,7 @@ async def test_structure_zoom_multi_provider(tmp_path):
             output_dir=str(tmp_path),
         )
 
-    structure_cells = [c for c in cells if c.zoom_level >= 16]
+    structure_cells = [c for c in cells if c.zoom_level == 16]
     assert len(structure_cells) > 0
     full = [c for c in structure_cells if len(c.provider_images) == 2]
     assert len(full) > 0
@@ -369,7 +377,7 @@ async def test_structure_filenames_have_provider_suffix(tmp_path):
             output_dir=str(tmp_path),
         )
 
-    structure_cells = [c for c in cells if c.zoom_level >= 16 and len(c.provider_images) == 2]
+    structure_cells = [c for c in cells if c.zoom_level == 16 and len(c.provider_images) == 2]
     assert len(structure_cells) > 0
     c = structure_cells[0]
     filenames = [Path(p).name for p in c.provider_images.values()]
@@ -378,20 +386,21 @@ async def test_structure_filenames_have_provider_suffix(tmp_path):
 
 
 async def test_structure_api_calls_count_per_provider(tmp_path):
-    """2 providers at structure level means 2 API calls per cell."""
+    """2 providers at structure level means 2 API calls per cell + 1 zoom-15 context fetch."""
     p1 = PlaceholderProvider(provider_name="a")
     p2 = PlaceholderProvider(provider_name="b")
     reg = ImageProviderRegistry()
     reg.register(p1, ["overview", "structure"])
     reg.register(p2, ["structure"])
 
+    # Budget: root(1) + 1 depth-1(1) + 2 depth-2 cells at (2 providers + 1 z15 ctx) = 1 + 1 + 2*3 = 8.
     with _vision_patches()[0], _vision_patches()[1], _vision_patches()[2], _vision_patches()[3], _vision_patches()[4]:
         cells = await analyze_cell(
-            MARCO, reg, start_zoom=12, max_depth=2, max_api_calls=6,
+            MARCO, reg, start_zoom=12, max_depth=2, max_api_calls=8,
             output_dir=str(tmp_path),
         )
 
-    structure_cells = [c for c in cells if c.zoom_level >= 16 and len(c.provider_images) == 2]
+    structure_cells = [c for c in cells if c.zoom_level == 16 and len(c.provider_images) == 2]
     assert len(structure_cells) == 2
 
 
