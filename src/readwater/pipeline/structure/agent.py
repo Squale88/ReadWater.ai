@@ -394,8 +394,15 @@ async def run_structure_phase(
     coverage_miles: float = 0.37,
     budget: StructureBudget | None = None,
     extractor_registry: dict | None = None,  # kept for Phase 2 injection
+    evidence_masks: dict[str, str] | None = None,
 ) -> StructurePhaseResult:
-    """Run the full structure phase for one confirmed zoom-16 cell."""
+    """Run the full structure phase for one confirmed zoom-16 cell.
+
+    `evidence_masks` is an optional dict of {layer_name: mask_png_path} used
+    to inject ground-truth evidence (water, charted channel, surveyed oyster
+    reef, surveyed seagrass) into the discovery prompt. See
+    pipeline.evidence for the expected format.
+    """
     budget = budget or StructureBudget()
     paths = StructurePaths.for_cell(Path(base_output_dir), cell_id)
     paths.structures_root.mkdir(parents=True, exist_ok=True)
@@ -404,12 +411,17 @@ async def run_structure_phase(
     result = StructurePhaseResult(cell_id=cell_id)
 
     # --- DISCOVER ---
-    logger.info("[structure:%s] DISCOVER", cell_id)
+    logger.info(
+        "[structure:%s] DISCOVER (evidence=%s)",
+        cell_id,
+        sorted(evidence_masks.keys()) if evidence_masks else "none",
+    )
     budget.charge_call()
     try:
         discovery = await llm.discover_anchors(
             z15_image_path, z16_image_path, parent_context, cell_center,
             coverage_miles, grid_out_dir=paths.grid_overlay_dir,
+            evidence_masks=evidence_masks,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("[structure:%s] discovery failed: %s", cell_id, e)

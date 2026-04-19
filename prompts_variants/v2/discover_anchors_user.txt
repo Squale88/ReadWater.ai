@@ -9,8 +9,18 @@ Each grid cell is approximately {cell_side_ft} ft x {cell_side_ft} ft.
 So a 500 ft × 500 ft feature will occupy roughly {small_feature_cells} cells, and a
 1500 ft × 1500 ft feature will occupy roughly {large_feature_cells} cells.
 
+{evidence_section}
+
 Identify the major pieces of inshore fishing structure and the grids they occupy.
 Ignore areas not connected to the main water flows (often reddish-brown stagnant water).
+
+If the evidence table is present, use it to validate or reject your visual guesses:
+  - Any cell with charted-channel coverage is a BOATING CHANNEL, not a drain or cut.
+  - Cells with surveyed oyster reef are strong positive evidence for oyster_bar features.
+  - Cells with no surveyed oyster reef can still be called oyster_bar from visual evidence
+    alone, but assign lower confidence when you do.
+  - Seagrass surveys may overstate current live extent due to die-off; treat as an
+    upper bound on grass-flat features.
 
 ```json
 {{

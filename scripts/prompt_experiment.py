@@ -36,12 +36,9 @@ import argparse
 import asyncio
 import base64
 import json
-import math
 import os
 import re
-import string
 import sys
-from collections import Counter
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -63,6 +60,10 @@ sys.path.insert(0, str(WORKTREE / "src"))
 
 import anthropic  # noqa: E402
 
+from readwater.pipeline.evidence import (  # noqa: E402
+    build_evidence_table,
+    format_evidence_for_prompt,
+)
 from readwater.pipeline.structure.grid_overlay import (  # noqa: E402
     cells_to_bbox,
     draw_label_grid,
@@ -147,6 +148,23 @@ def _extract_json(text: str) -> dict:
     return json.loads(text.strip())
 
 
+def _auto_discover_mask_paths(cell_id: str) -> dict[str, str]:
+    """Look for pre-generated masks for this cell at the standard output paths.
+
+    Returns only layers whose mask file exists on disk, so missing layers
+    degrade gracefully to "no evidence for that layer."
+    """
+    data_root = REPO_ROOT / "data" / "areas"
+    candidates = {
+        "water":    data_root / "rookery_bay_v2_naip"    / f"{cell_id}_water_mask.png",
+        "channel":  data_root / "rookery_bay_v2_channels" / f"{cell_id}_channel_mask.png",
+        "oyster":   data_root / "rookery_bay_v2_habitats" / f"{cell_id}_oyster_mask.png",
+        "seagrass": data_root / "rookery_bay_v2_habitats" / f"{cell_id}_seagrass_mask.png",
+    }
+    found = {k: str(v) for k, v in candidates.items() if v.exists()}
+    return found
+
+
 async def run_once(
     z15_path: str,
     z16_gridded_path: str,
@@ -155,6 +173,7 @@ async def run_once(
     grid_cols: int,
     coverage_miles: float,
     variant: str,
+    evidence_masks: dict[str, str] | None = None,
 ) -> dict:
     client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     system_prompt = load_variant_prompt(variant, "discover_anchors_system.txt")
@@ -169,6 +188,16 @@ async def run_once(
     if cell_meta.get("parent_context"):
         context_line = f"\nParent-cell context:\n{cell_meta['parent_context']}\n"
 
+    evidence_section = ""
+    if evidence_masks:
+        evidence = build_evidence_table(
+            mask_paths=evidence_masks,
+            grid_rows=grid_rows,
+            grid_cols=grid_cols,
+            image_size=(1280, 1280),
+        )
+        evidence_section = format_evidence_for_prompt(evidence)
+
     user_prompt = user_template.format(
         parent_context=context_line,
         center_lat=f"{cell_meta['cell_center'][0]:.4f}",
@@ -177,6 +206,7 @@ async def run_once(
         grid_rows=grid_rows,
         grid_cols=grid_cols,
         last_row=row_label(grid_rows - 1),
+        evidence_section=evidence_section,
         tile_side_ft=tile_side_ft,
         cell_side_ft=cell_side_ft,
         small_feature_cells=small_feature_cells,
@@ -313,7 +343,13 @@ def consistency_summary(runs: list[dict]) -> dict:
 # --- Main ---
 
 
-async def run_for_cell(variant: str, cell_id: str, repeats: int, exp_dir: Path) -> None:
+async def run_for_cell(
+    variant: str,
+    cell_id: str,
+    repeats: int,
+    exp_dir: Path,
+    use_evidence: bool = False,
+) -> None:
     cell_meta = CELLS[cell_id]
     z16 = str(cell_meta["z16"])
     z15 = str(cell_meta["z15"])
@@ -329,7 +365,18 @@ async def run_for_cell(variant: str, cell_id: str, repeats: int, exp_dir: Path) 
     gridded_path = cell_dir / "gridded_input.png"
     draw_label_grid(z16, grid_rows, grid_cols, str(gridded_path))
 
-    print(f"\n=== {cell_id}  variant={variant}  repeats={repeats}  grid={grid_rows}x{grid_cols} ===")
+    evidence_masks: dict[str, str] | None = None
+    if use_evidence:
+        evidence_masks = _auto_discover_mask_paths(cell_id)
+        if not evidence_masks:
+            print(f"WARNING [{cell_id}]: --with-evidence was set but no masks "
+                  f"were found at the standard paths. Runs will proceed without evidence.")
+            evidence_masks = None
+        else:
+            print(f"[{cell_id}] evidence layers found: {sorted(evidence_masks.keys())}")
+
+    print(f"\n=== {cell_id}  variant={variant}  repeats={repeats}  "
+          f"grid={grid_rows}x{grid_cols}  evidence={'on' if evidence_masks else 'off'} ===")
     print(f"gridded input: {gridded_path}")
 
     runs: list[dict] = []
@@ -340,6 +387,7 @@ async def run_for_cell(variant: str, cell_id: str, repeats: int, exp_dir: Path) 
             grid_rows, grid_cols,
             coverage_miles=0.37,
             variant=variant,
+            evidence_masks=evidence_masks,
         )
         raw = resp.pop("_raw", "")
         user_prompt = resp.pop("_user_prompt", "")
@@ -389,19 +437,27 @@ async def main() -> None:
     parser.add_argument("--cell", default="root-10-8",
                         choices=list(CELLS.keys()) + ["both"])
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--with-evidence", action="store_true",
+                        help="auto-discover pre-generated water/channel/oyster/seagrass "
+                             "masks for each cell and inject per-cell evidence into the "
+                             "discovery prompt.")
     args = parser.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise SystemExit("ANTHROPIC_API_KEY not set")
 
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    exp_dir = EXPERIMENTS_ROOT / f"{ts}_{args.variant}"
+    suffix = f"{args.variant}{'_evid' if args.with_evidence else ''}"
+    exp_dir = EXPERIMENTS_ROOT / f"{ts}_{suffix}"
     exp_dir.mkdir(parents=True, exist_ok=True)
     print(f"Experiment dir: {exp_dir}")
 
     cells = list(CELLS.keys()) if args.cell == "both" else [args.cell]
     for cid in cells:
-        await run_for_cell(args.variant, cid, args.repeats, exp_dir)
+        await run_for_cell(
+            args.variant, cid, args.repeats, exp_dir,
+            use_evidence=args.with_evidence,
+        )
 
     print(f"\nAll done. Browse outputs in: {exp_dir}")
 

@@ -28,6 +28,10 @@ from readwater.api.claude_vision import (
     _get_client,
     _load_prompt,
 )
+from readwater.pipeline.evidence import (
+    build_evidence_table,
+    format_evidence_for_prompt,
+)
 from readwater.pipeline.structure.grid_overlay import (
     draw_label_grid,
     grid_shape_for_image,
@@ -104,8 +108,16 @@ async def discover_anchors(
     coverage_miles: float,
     grid_out_dir: str | Path,
     short_axis_cells: int = DEFAULT_DISCOVER_SHORT,
+    evidence_masks: dict[str, str] | None = None,
 ) -> dict:
-    """DISCOVER: parent z15 + gridded z16 → anchor candidates with cell lists."""
+    """DISCOVER: parent z15 + gridded z16 → anchor candidates with cell lists.
+
+    Optional `evidence_masks` is a dict of {layer_name: mask_png_path} with
+    any of these keys: 'water', 'channel', 'oyster', 'seagrass'. When
+    provided, per-cell coverage fractions are computed and injected into
+    the user prompt so Claude can validate visual guesses against
+    surveyed ground-truth.
+    """
     client = _get_client()
     system_prompt = _load_prompt("discover_anchors_system.txt")
     user_template = _load_prompt("discover_anchors_user.txt")
@@ -118,7 +130,22 @@ async def discover_anchors(
     if parent_context:
         context_line = f"\nParent-cell context:\n{parent_context}\n"
 
-    user_prompt = user_template.format(
+    evidence_section = ""
+    if evidence_masks:
+        try:
+            evidence = build_evidence_table(
+                mask_paths=evidence_masks,
+                grid_rows=rows,
+                grid_cols=cols,
+                image_size=(1280, 1280),
+            )
+            evidence_section = format_evidence_for_prompt(evidence)
+        except Exception:  # noqa: BLE001
+            # Any failure computing evidence should degrade gracefully — the
+            # LLM call still goes through, just without the extra signal.
+            evidence_section = ""
+
+    format_kwargs = dict(
         parent_context=context_line,
         center_lat=f"{center[0]:.4f}",
         center_lon=f"{center[1]:.4f}",
@@ -126,7 +153,21 @@ async def discover_anchors(
         grid_rows=rows,
         grid_cols=cols,
         last_row=row_label(rows - 1),
+        evidence_section=evidence_section,
     )
+    # The v2 prompt also has tile/cell-dimension placeholders; fill them if
+    # present in the template.
+    tile_side_ft = int(round(coverage_miles * 5280))
+    cell_side_ft = int(round(tile_side_ft / max(rows, cols)))
+    if cell_side_ft > 0:
+        format_kwargs["tile_side_ft"] = tile_side_ft
+        format_kwargs["cell_side_ft"] = cell_side_ft
+        format_kwargs["small_feature_cells"] = max(1, round((500 / cell_side_ft) ** 2))
+        format_kwargs["large_feature_cells"] = max(1, round((1500 / cell_side_ft) ** 2))
+
+    # str.format silently ignores extra kwargs, so the same kwargs dict works
+    # for both the main prompt and the v2 variant which has extra placeholders.
+    user_prompt = user_template.format(**format_kwargs)
 
     response = await client.messages.create(
         model=MODEL,

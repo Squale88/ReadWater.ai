@@ -6,7 +6,9 @@ Zoom-16 cell center: ({center_lat}, {center_lon})
 Zoom-16 coverage: ~{coverage_miles} miles per side
 Grid: {grid_rows} rows (A..{last_row}) x {grid_cols} columns (1..{grid_cols})
 
-List the anchor structures. Prefer fewer, higher-quality anchors over many weak ones.
+{evidence_section}
+
+List the anchor structures. Prefer fewer, higher-quality anchors over many weak ones. Use the evidence table (when present) to validate or reject visual guesses: if a cell is charted navigation channel, do not call it a drain; if a cell has surveyed oyster reef, treat it as strong positive evidence; if a cell has zero surveyed oyster reef, you may still propose oyster structure from imagery but flag lower confidence.
 
 ```json
 {{
