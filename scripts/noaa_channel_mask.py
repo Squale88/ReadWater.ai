@@ -46,10 +46,14 @@ from readwater.api.data_sources.noaa_enc import (  # noqa: E402
     download_enc,
     extract_channels,
 )
-from readwater.pipeline.channel_mask import (  # noqa: E402
-    rasterize_channels,
-    save_channel_overlay_png,
+from readwater.pipeline.polygon_mask import (  # noqa: E402
+    rasterize_polygons,
+    save_polygon_overlay_png,
 )
+
+# Channel overlay tint (red, for "warning — this is a boating channel, do
+# not label it a drain").
+CHANNEL_RGBA = (255, 0, 0, 120)
 
 OUT_ROOT = REPO_ROOT / "data" / "areas" / "rookery_bay_v2_channels"
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -107,7 +111,7 @@ def run_one(cell_id: str, chart_id: str, channels_geojson: str) -> dict:
 
     mask_png = OUT_ROOT / f"{cell_id}_channel_mask.png"
     mask_tif = OUT_ROOT / f"{cell_id}_channel_mask.tif"
-    raster_result = rasterize_channels(
+    raster_result = rasterize_polygons(
         channels_geojson,
         bbox_4326=bbox,
         out_size=(1280, 1280),
@@ -124,12 +128,13 @@ def run_one(cell_id: str, chart_id: str, channels_geojson: str) -> dict:
     overlay_path = OUT_ROOT / f"{cell_id}_channel_overlay.png"
     if naip_rgb.exists():
         mask_bool = np.array(Image.open(mask_png).convert("L")) > 0
-        save_channel_overlay_png(
+        save_polygon_overlay_png(
             rgb_image_path=naip_rgb,
             mask_bool=mask_bool,
             rgb_bbox_4326=bbox,
             mask_bbox_4326=bbox,
             out_path=overlay_path,
+            rgba=CHANNEL_RGBA,
             outline_only=False,
         )
         print(f"  overlay (NAIP + channel tint) -> {overlay_path}")
