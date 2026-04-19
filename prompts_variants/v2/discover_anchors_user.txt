@@ -1,0 +1,34 @@
+Image 1 is the zoom-15 parent context (~0.75 mi per side).
+Image 2 is the zoom-16 cell with a {grid_rows}x{grid_cols} labeled grid (~0.37 mi per side, ~{tile_side_ft} ft per side).
+
+{parent_context}
+Zoom-16 cell center: ({center_lat}, {center_lon})
+Zoom-16 coverage: ~{coverage_miles} miles per side (~{tile_side_ft} ft per side)
+Grid: {grid_rows} rows (A..{last_row}) x {grid_cols} columns (1..{grid_cols})
+Each grid cell is approximately {cell_side_ft} ft x {cell_side_ft} ft.
+So a 500 ft × 500 ft feature will occupy roughly {small_feature_cells} cells, and a
+1500 ft × 1500 ft feature will occupy roughly {large_feature_cells} cells.
+
+Identify the major pieces of inshore fishing structure and the grids they occupy.
+Ignore areas not connected to the main water flows (often reddish-brown stagnant water).
+
+```json
+{{
+  "summary": "one-line description of the tile as a fishing picture",
+  "anchors": [
+    {{
+      "anchor_id": "a1",
+      "structure_type": "drain",
+      "scale": "major",
+      "rationale": "narrow tidal cut draining a shallow back bay, clear current alignment with the parent-image channel",
+      "confidence": 0.85,
+      "expected_relevance": 0.8,
+      "truncated_by_edge": false,
+      "continuation_edges": {{"north": false, "south": false, "east": false, "west": false}},
+      "expansion_priority": 0.2,
+      "parent_context_needed": false,
+      "cells": ["C3", "C4", "D3", "D4"]
+    }}
+  ]
+}}
+```
