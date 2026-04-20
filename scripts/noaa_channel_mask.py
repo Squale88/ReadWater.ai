@@ -37,10 +37,12 @@ if _env_path.exists():
 
 WORKTREE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKTREE / "src"))
+sys.path.insert(0, str(WORKTREE / "scripts"))
 
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
+from _cells import CELLS  # noqa: E402
 from readwater.api.data_sources.naip_4band import bbox_from_center  # noqa: E402
 from readwater.api.data_sources.noaa_enc import (  # noqa: E402
     download_enc,
@@ -59,11 +61,6 @@ OUT_ROOT = REPO_ROOT / "data" / "areas" / "rookery_bay_v2_channels"
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 ENC_CACHE = REPO_ROOT / "data" / "noaa_enc_cache"
 ENC_CACHE.mkdir(parents=True, exist_ok=True)
-
-CELLS = {
-    "root-10-8": {"center": (26.011172, -81.753546), "zoom": 16},
-    "root-11-5": {"center": (26.011172, -81.739780), "zoom": 16},
-}
 
 # US4FL1JT: "Gordon Pass to Gullivan Bay" (1:45,000) — covers Rookery Bay,
 # Marco Island, Naples. Identified by querying the NOAA ENC product catalog
@@ -153,7 +150,13 @@ def run_one(cell_id: str, chart_id: str, channels_geojson: str) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cell", choices=list(CELLS.keys()) + ["both"], default="both")
+    parser.add_argument(
+        "--cell",
+        choices=list(CELLS.keys()) + ["all", "both"],
+        default="all",
+        help="Single cell id, or 'all' for every cell in _cells.CELLS. "
+             "'both' is kept as a legacy alias meaning the two original cells.",
+    )
     parser.add_argument("--chart-id", default=DEFAULT_CHART_ID)
     args = parser.parse_args()
 
@@ -163,7 +166,12 @@ def main() -> None:
 
     channels_geojson = ensure_channels_geojson(enc_file, args.chart_id)
 
-    cells = list(CELLS.keys()) if args.cell == "both" else [args.cell]
+    if args.cell == "all":
+        cells = list(CELLS.keys())
+    elif args.cell == "both":
+        cells = ["root-10-8", "root-11-5"]
+    else:
+        cells = [args.cell]
     results = []
     for cid in cells:
         results.append(run_one(cid, args.chart_id, channels_geojson))

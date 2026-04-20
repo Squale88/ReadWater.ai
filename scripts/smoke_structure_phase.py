@@ -36,34 +36,14 @@ if _env_path.exists():
 # Ensure the worktree src/ is on sys.path before the non-worktree install.
 WORKTREE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKTREE / "src"))
+sys.path.insert(0, str(WORKTREE / "scripts"))
 
-from readwater.api.providers.google_static import GoogleStaticProvider
-from readwater.pipeline.structure.agent import StructureBudget, run_structure_phase
+from _cells import CELLS  # noqa: E402
+from readwater.api.providers.google_static import GoogleStaticProvider  # noqa: E402
+from readwater.pipeline.structure.agent import StructureBudget, run_structure_phase  # noqa: E402
 
 
-DATA_ROOT = Path("D:/dropbox_root/Dropbox/CascadeProjects/ReadWater.ai/data/areas/rookery_bay_v2/images")
 OUT_ROOT = Path("D:/dropbox_root/Dropbox/CascadeProjects/ReadWater.ai/data/areas/rookery_bay_v2_structure_test/images")
-
-CELLS = {
-    "root-10-8": {
-        "center": (26.011172, -81.753546),
-        "z16": DATA_ROOT / "z0_10_8.png",
-        "z15": DATA_ROOT / "z0_10_8_context_z15.png",
-        "parent_context": (
-            "Rookery Bay, SW Florida. Parent zoom-14 cell shows mangrove-lined "
-            "estuarine shoreline with tidal cuts and shallow basins."
-        ),
-    },
-    "root-11-5": {
-        "center": (26.011172, -81.739780),
-        "z16": DATA_ROOT / "z0_11_5.png",
-        "z15": DATA_ROOT / "z0_11_5_context_z15.png",
-        "parent_context": (
-            "Rookery Bay, SW Florida. Parent zoom-14 cell shows interior bay "
-            "water with mangrove islands and connecting channels."
-        ),
-    },
-}
 
 
 async def run_one(cell_id: str, budget: StructureBudget) -> None:
@@ -122,7 +102,13 @@ async def run_one(cell_id: str, budget: StructureBudget) -> None:
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cell", choices=["root-10-8", "root-11-5", "both"], default="root-10-8")
+    parser.add_argument(
+        "--cell",
+        choices=list(CELLS.keys()) + ["all", "both"],
+        default="root-10-8",
+        help="Single cell id, 'all' for every cell in _cells.CELLS, or "
+             "'both' (legacy alias for the two original cells).",
+    )
     parser.add_argument("--calls-per-anchor", type=int, default=10)
     parser.add_argument("--tiles-per-anchor", type=int, default=16)
     parser.add_argument("--max-anchors", type=int, default=2)
@@ -144,7 +130,12 @@ async def main() -> None:
         max_anchors_per_cell=args.max_anchors,
     )
 
-    cells = ["root-10-8", "root-11-5"] if args.cell == "both" else [args.cell]
+    if args.cell == "all":
+        cells = list(CELLS.keys())
+    elif args.cell == "both":
+        cells = ["root-10-8", "root-11-5"]
+    else:
+        cells = [args.cell]
     for cid in cells:
         await run_one(cid, budget)
 

@@ -36,10 +36,12 @@ if _env_path.exists():
 
 WORKTREE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKTREE / "src"))
+sys.path.insert(0, str(WORKTREE / "scripts"))
 
 import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
+from _cells import CELLS  # noqa: E402
 from readwater.api.data_sources.fwc_habitats import (  # noqa: E402
     fetch_oyster_beds,
     fetch_seagrass,
@@ -56,11 +58,6 @@ OUT_ROOT.mkdir(parents=True, exist_ok=True)
 # Marco / Naples / Rookery Bay area bbox. Used once to pull the full FWC
 # polygon set; per-cell masks are clipped from that.
 AREA_BBOX = (-81.90, 25.85, -81.60, 26.30)
-
-CELLS = {
-    "root-10-8": {"center": (26.011172, -81.753546), "zoom": 16},
-    "root-11-5": {"center": (26.011172, -81.739780), "zoom": 16},
-}
 
 # Tint colors for the overlays. Distinct from channel (red) and water (blue).
 OYSTER_RGBA = (180, 50, 200, 120)    # purple — marine GIS convention
@@ -151,13 +148,24 @@ def process_cell(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cell", choices=list(CELLS.keys()) + ["both"], default="both")
+    parser.add_argument(
+        "--cell",
+        choices=list(CELLS.keys()) + ["all", "both"],
+        default="all",
+        help="Single cell id, or 'all' for every cell in _cells.CELLS. "
+             "'both' is kept as a legacy alias meaning the two original cells.",
+    )
     args = parser.parse_args()
 
     oyster_gj = ensure_oyster_geojson()
     seagrass_gj = ensure_seagrass_geojson()
 
-    cells = list(CELLS.keys()) if args.cell == "both" else [args.cell]
+    if args.cell == "all":
+        cells = list(CELLS.keys())
+    elif args.cell == "both":
+        cells = ["root-10-8", "root-11-5"]
+    else:
+        cells = [args.cell]
     results = []
     for cid in cells:
         results.append(process_cell(cid, oyster_gj, seagrass_gj))

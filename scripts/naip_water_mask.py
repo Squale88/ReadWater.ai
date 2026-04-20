@@ -35,16 +35,13 @@ if _env_path.exists():
 
 WORKTREE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKTREE / "src"))
+sys.path.insert(0, str(WORKTREE / "scripts"))
 
+from _cells import CELLS  # noqa: E402
 from readwater.api.providers.naip import NAIPProvider  # noqa: E402
 
 OUT_ROOT = REPO_ROOT / "data" / "areas" / "rookery_bay_v2_naip"
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
-
-CELLS = {
-    "root-10-8": {"center": (26.011172, -81.753546), "zoom": 16},
-    "root-11-5": {"center": (26.011172, -81.739780), "zoom": 16},
-}
 
 
 async def fetch_rgb(cell_id: str, center, zoom) -> str:
@@ -131,9 +128,20 @@ async def run_one(cell_id: str) -> dict:
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cell", choices=list(CELLS.keys()) + ["both"], default="root-10-8")
+    parser.add_argument(
+        "--cell",
+        choices=list(CELLS.keys()) + ["all", "both"],
+        default="root-10-8",
+        help="Single cell id, or 'all' for every cell in _cells.CELLS. "
+             "'both' is kept as a legacy alias meaning the two original cells.",
+    )
     args = parser.parse_args()
-    cells = list(CELLS.keys()) if args.cell == "both" else [args.cell]
+    if args.cell == "all":
+        cells = list(CELLS.keys())
+    elif args.cell == "both":
+        cells = ["root-10-8", "root-11-5"]
+    else:
+        cells = [args.cell]
     for cid in cells:
         await run_one(cid)
     print(f"\nAll artifacts in: {OUT_ROOT}")

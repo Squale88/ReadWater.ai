@@ -57,9 +57,11 @@ if _env_path.exists():
 
 WORKTREE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(WORKTREE / "src"))
+sys.path.insert(0, str(WORKTREE / "scripts"))
 
 import anthropic  # noqa: E402
 
+from _cells import CELLS  # noqa: E402
 from readwater.pipeline.evidence import (  # noqa: E402
     build_evidence_table,
     format_evidence_for_prompt,
@@ -74,32 +76,10 @@ from readwater.pipeline.structure.grid_overlay import (  # noqa: E402
 MODEL = "claude-opus-4-20250514"
 MAX_TOKENS = 6000
 
-DATA_ROOT = REPO_ROOT / "data" / "areas" / "rookery_bay_v2" / "images"
 VARIANTS_ROOT = WORKTREE / "prompts_variants"
 MAIN_PROMPTS = WORKTREE / "prompts"
 EXPERIMENTS_ROOT = REPO_ROOT / "data" / "prompt_experiments"
 EXPERIMENTS_ROOT.mkdir(parents=True, exist_ok=True)
-
-CELLS = {
-    "root-10-8": {
-        "z16": DATA_ROOT / "z0_10_8.png",
-        "z15": DATA_ROOT / "z0_10_8_context_z15.png",
-        "cell_center": (26.011172, -81.753546),
-        "parent_context": (
-            "Rookery Bay, SW Florida. Parent zoom-14 cell shows mangrove-lined "
-            "estuarine shoreline with tidal cuts and shallow basins."
-        ),
-    },
-    "root-11-5": {
-        "z16": DATA_ROOT / "z0_11_5.png",
-        "z15": DATA_ROOT / "z0_11_5_context_z15.png",
-        "cell_center": (26.011172, -81.739780),
-        "parent_context": (
-            "Rookery Bay, SW Florida. Parent zoom-14 cell shows interior bay "
-            "water with mangrove islands and connecting channels."
-        ),
-    },
-}
 
 
 # --- Prompt resolution ---
@@ -213,21 +193,41 @@ async def run_once(
         large_feature_cells=large_feature_cells,
     )
 
-    resp = await client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    _image_block_jpeg(z15_path),
-                    _image_block_jpeg(z16_gridded_path),
-                    {"type": "text", "text": user_prompt},
+    # Retry with exponential backoff on transient API errors (overload, rate
+    # limit, brief network failures). Discovery is a single Claude call and
+    # losing a run midway through an 8-cell sweep means redoing everything,
+    # so we give it a few tries.
+    max_retries = 5
+    delay = 15.0
+    last_err: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            resp = await client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=system_prompt,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            _image_block_jpeg(z15_path),
+                            _image_block_jpeg(z16_gridded_path),
+                            {"type": "text", "text": user_prompt},
+                        ],
+                    }
                 ],
-            }
-        ],
-    )
+            )
+            break
+        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            last_err = e
+            if attempt + 1 == max_retries:
+                raise
+            print(f"  [retry] attempt {attempt + 1} failed ({type(e).__name__}: "
+                  f"{e}); sleeping {delay:.0f}s and retrying...")
+            await asyncio.sleep(delay)
+            delay *= 2
+    else:
+        raise RuntimeError(f"exhausted retries: {last_err}")
     raw = resp.content[0].text
     parsed = _extract_json(raw)
     parsed["_raw"] = raw
@@ -435,7 +435,10 @@ async def main() -> None:
     parser.add_argument("--variant", required=True,
                         help="variant name under prompts_variants/ (e.g. 'v2')")
     parser.add_argument("--cell", default="root-10-8",
-                        choices=list(CELLS.keys()) + ["both"])
+                        choices=list(CELLS.keys()) + ["all", "both"],
+                        help="Single cell id, 'all' for every cell in "
+                             "_cells.CELLS, or 'both' (legacy alias for the "
+                             "two original cells root-10-8 + root-11-5).")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--with-evidence", action="store_true",
                         help="auto-discover pre-generated water/channel/oyster/seagrass "
@@ -452,7 +455,12 @@ async def main() -> None:
     exp_dir.mkdir(parents=True, exist_ok=True)
     print(f"Experiment dir: {exp_dir}")
 
-    cells = list(CELLS.keys()) if args.cell == "both" else [args.cell]
+    if args.cell == "all":
+        cells = list(CELLS.keys())
+    elif args.cell == "both":
+        cells = ["root-10-8", "root-11-5"]
+    else:
+        cells = [args.cell]
     for cid in cells:
         await run_for_cell(
             args.variant, cid, args.repeats, exp_dir,
