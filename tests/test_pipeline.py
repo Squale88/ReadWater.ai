@@ -39,30 +39,18 @@ def registry():
     return reg
 
 
-def _placeholder_grid_result():
-    """Default grid analysis result: all cells score 5."""
+def _placeholder_dual_pass_result():
+    """Default dual-pass grid result: all cells score 5 (confident keep)."""
     return {
-        "summary": "Placeholder grid analysis",
+        "summary": "Placeholder dual-pass analysis",
         "sub_scores": [
             {"cell_number": i, "score": 5.0, "reasoning": "Placeholder"}
             for i in range(1, 17)
         ],
         "hydrology_notes": "",
         "raw_response": "",
-    }
-
-
-def _placeholder_structure_result():
-    """Default structure analysis result."""
-    return {
-        "summary": "Placeholder structure analysis",
-        "fishable_features": [],
-        "tide_interaction": "",
-        "wind_exposure": "",
-        "recommended_species": [],
-        "access_notes": "",
-        "overall_rating": 5.0,
-        "raw_response": "",
+        "raw_response_yes": "",
+        "raw_response_no": "",
     }
 
 
@@ -77,9 +65,9 @@ def fast_registry(registry):
     with (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
         patch(
-            "readwater.pipeline.cell_analyzer.analyze_grid_image",
+            "readwater.pipeline.cell_analyzer.dual_pass_grid_scoring",
             new_callable=AsyncMock,
-            return_value=_placeholder_grid_result(),
+            return_value=_placeholder_dual_pass_result(),
         ),
         patch(
             "readwater.pipeline.cell_analyzer.run_structure_phase",
@@ -332,7 +320,7 @@ def _vision_patches():
     """Context manager that mocks all vision calls + sleep for non-dry-run tests."""
     return (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
-        patch("readwater.pipeline.cell_analyzer.analyze_grid_image", new_callable=AsyncMock, return_value=_placeholder_grid_result()),
+        patch("readwater.pipeline.cell_analyzer.dual_pass_grid_scoring", new_callable=AsyncMock, return_value=_placeholder_dual_pass_result()),
         patch("readwater.pipeline.cell_analyzer.run_structure_phase", new_callable=AsyncMock, return_value=_placeholder_structure_phase_result()),
         patch("readwater.pipeline.cell_analyzer.confirm_fishing_water", new_callable=AsyncMock, return_value=_placeholder_confirm_result()),
         patch("readwater.pipeline.cell_analyzer.draw_grid_overlay", side_effect=lambda p, **kw: p),
@@ -416,7 +404,7 @@ async def test_overview_single_provider_no_suffix(fast_registry, tmp_path):
 
 
 async def test_metadata_records_provider(fast_registry, tmp_path):
-    cells = await analyze_cell(
+    await analyze_cell(
         MARCO, fast_registry, max_api_calls=1, max_depth=0, output_dir=str(tmp_path),
     )
     meta = json.loads((tmp_path / "metadata.json").read_text())
@@ -463,20 +451,22 @@ async def test_sub_cell_half_dimensions(registry):
 # --- Mocked Claude vision: selective pruning ---
 
 
-def _mock_grid_result(high_cells=(1, 2, 3, 4)):
-    """Grid analysis result: high scores for specified cells, low for others."""
+def _mock_dual_pass_result(high_cells=(1, 2, 3, 4)):
+    """Dual-pass result: high cells score 5 (both YES), others score 0 (both NO)."""
     return {
         "summary": "Mock analysis",
         "sub_scores": [
             {
                 "cell_number": i,
-                "score": 8.0 if i in high_cells else 1.0,
+                "score": 5.0 if i in high_cells else 0.0,
                 "reasoning": f"Cell {i} mock",
             }
             for i in range(1, 17)
         ],
         "hydrology_notes": "Mock hydrology",
         "raw_response": "",
+        "raw_response_yes": "",
+        "raw_response_no": "",
     }
 
 
@@ -487,11 +477,11 @@ async def test_vision_pruning_only_high_cells_recurse(tmp_path):
     reg = ImageProviderRegistry()
     reg.register(PlaceholderProvider(), ["overview", "structure"])
 
-    mock_result = _mock_grid_result(high_cells=(1, 2, 3, 4))
+    mock_result = _mock_dual_pass_result(high_cells=(1, 2, 3, 4))
 
     with (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
-        patch("readwater.pipeline.cell_analyzer.analyze_grid_image", new_callable=AsyncMock, return_value=mock_result),
+        patch("readwater.pipeline.cell_analyzer.dual_pass_grid_scoring", new_callable=AsyncMock, return_value=mock_result),
         patch("readwater.pipeline.cell_analyzer.confirm_fishing_water", new_callable=AsyncMock, return_value=_placeholder_confirm_result()),
         patch("readwater.pipeline.cell_analyzer.draw_grid_overlay", side_effect=lambda p, **kw: p),
     ):

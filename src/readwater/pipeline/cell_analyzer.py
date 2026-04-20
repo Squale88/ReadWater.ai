@@ -18,8 +18,8 @@ from pathlib import Path
 from readwater.api.claude_vision import (
     MODEL,
     _cell_number_to_row_col,
-    analyze_grid_image,
     confirm_fishing_water,
+    dual_pass_grid_scoring,
 )
 from readwater.api.providers.registry import ImageProviderRegistry
 from readwater.models.cell import BoundingBox, Cell, CellAnalysis, CellScore
@@ -327,60 +327,44 @@ async def _analyze_recursive(
         first_image = next(iter(provider_images.values()))
         is_structure_phase_cell = zoom == STRUCTURE_PHASE_ZOOM
 
-        # --- Confirmation gate (depth > 0 only) ---
-        # Parent's grid scoring flagged this cell. Before spending an API call
-        # on grid analysis, confirm there's actually fishing water here.
-        if depth > 0:
-            confirm_result = await confirm_fishing_water(
-                first_image, parent_context, center, size_miles,
-            )
-            raw_confirm = confirm_result.pop("raw_response", "")
-            if raw_confirm:
-                md_path = Path(first_image).with_name(
-                    Path(first_image).stem + "_confirm.md"
-                )
-                md_path.write_text(raw_confirm, encoding="utf-8")
-
-            if not confirm_result.get("has_fishing_water", False):
-                logger.info(
-                    "Confirmation rejected cell %s: %s",
-                    cell_id, confirm_result.get("reasoning", ""),
-                )
-                analysis = CellAnalysis(
-                    overall_summary=f"Rejected: {confirm_result.get('reasoning', 'no fishing water')}",
-                    sub_scores=[
-                        CellScore(row=r, col=c, score=0.0, summary="Rejected by confirmation", center=ctr)
-                        for r, c, ctr in sub_cells_geo
-                    ],
-                    model_used=MODEL,
-                )
-                # Build cell with rejection, skip grid scoring and recursion
-                first_img_path = next(iter(provider_images.values()), None)
-                cell = Cell(
-                    id=cell_id, parent_id=parent_cell_id, center=center,
-                    size_miles=size_miles, depth=depth, zoom_level=zoom,
-                    bbox=bbox, analysis=analysis, image_path=first_img_path,
-                    provider_images=provider_images,
-                )
-                state.metadata.append({
-                    "cell_id": cell_id, "center": list(center),
-                    "bbox": {"north": bbox.north, "south": bbox.south, "east": bbox.east, "west": bbox.west},
-                    "zoom": zoom, "depth": depth, "parent_id": parent_cell_id,
-                    "size_miles": size_miles, "provider_images": dict(provider_images),
-                    "providers": list(provider_images.keys()), "confirmed": False,
-                })
-                return [cell]
-
-        # --- Grid scoring (all non-rejected cells) ---
+        # --- Grid scoring (dual-pass with wider context image) ---
         grid_path = draw_grid_overlay(first_image)
+
+        # Fetch a wider-area context image at zoom-1 (2x coverage) at same center.
+        # Gives the model surrounding context to distinguish interior bay water
+        # from open ocean, and to see whether residential canals reach a bay.
+        context_image_path = None
+        if state.api_calls < state.max_api_calls and zoom > 1:
+            try:
+                context_zoom = zoom - 1
+                context_filename = (
+                    Path(first_image).stem + f"_context_z{context_zoom}.png"
+                )
+                context_image_path = str(state.output_dir / context_filename)
+                if state.api_calls > 0:
+                    await asyncio.sleep(0.5)
+                provider = state.registry.get_default_provider(_role_for_zoom(zoom))
+                await provider.fetch(center, context_zoom, context_image_path)
+                state.api_calls += 1
+            except Exception as e:
+                logger.warning("Context image fetch failed for %s: %s", cell_id, e)
+                context_image_path = None
+
         try:
-            vision_result = await analyze_grid_image(
+            vision_result = await dual_pass_grid_scoring(
                 grid_path, parent_context, zoom, center, size_miles,
+                context_image_path=context_image_path,
             )
-            raw_response = vision_result.pop("raw_response", "")
-            if raw_response:
-                md_path = Path(grid_path).with_suffix(".md")
-                md_path.write_text(raw_response, encoding="utf-8")
+            # Save raw responses as markdown
+            raw_yes = vision_result.pop("raw_response_yes", "")
+            raw_no = vision_result.pop("raw_response_no", "")
+            vision_result.pop("raw_response", None)  # consumed but not persisted
+            grid_stem = Path(grid_path).stem
+            grid_dir = Path(grid_path).parent
+            if raw_yes:
+                (grid_dir / f"{grid_stem}_yes.md").write_text(raw_yes, encoding="utf-8")
+            if raw_no:
+                (grid_dir / f"{grid_stem}_no.md").write_text(raw_no, encoding="utf-8")
             scored_cells = []
             for sc in vision_result.get("sub_scores", []):
                 row, col = _cell_number_to_row_col(sc["cell_number"])
@@ -409,6 +393,9 @@ async def _analyze_recursive(
             )
 
         # --- Structure phase at zoom 16 (replaces old zoom-18 terminal) ---
+        # After dual-pass grid scoring completes on a zoom-16 cell, fetch its
+        # zoom-15 parent-context image and hand both to the structure agent,
+        # which owns all zoom-18 tile fetches and LLM calls internally.
         if is_structure_phase_cell and state.registry is not None:
             try:
                 z15_provider = state.registry.get_default_provider(Z15_CONTEXT_PROVIDER_ROLE)
@@ -493,28 +480,85 @@ async def _analyze_recursive(
 
     all_cells = [cell]
 
-    # --- Recurse into sub-cells above threshold ---
-    # Structure-phase cells (zoom 16) own their own deeper investigation; do
-    # not descend to zoom 18 through the recursive path.
+    # --- Recurse into sub-cells ---
+    # Dual-pass scoring produces: 5 (confident keep), 3 (ambiguous), 0 (confident prune)
+    # In dry_run mode, placeholder scores are 5 and threshold controls pruning directly.
+    # In live mode:
+    # - Score >= threshold (5): recurse directly (confident keep)
+    # - Score == AMBIGUOUS (3): fetch child image, run confirmation, recurse if confirmed
+    # - Score < AMBIGUOUS (0 or dry_run below threshold): skip
+    # Structure-phase cells (zoom 16) already completed their per-anchor
+    # deeper investigation via run_structure_phase above; recursion from
+    # there is capped by TERMINAL_ZOOM so we never descend to zoom 18 through
+    # the recursive path.
+    AMBIGUOUS_SCORE = 3.0
     next_zoom = zoom + 2
     if depth < max_depth and next_zoom <= TERMINAL_ZOOM:
         for sub_score in analysis.sub_scores:
-            if sub_score.score >= state.threshold:
-                child_id = _make_cell_id(cell_id, sub_score.row, sub_score.col)
-                child_bbox = _sub_cell_bbox(bbox, sub_score.row, sub_score.col, SECTIONS)
-                child_cells = await _analyze_recursive(
-                    center=sub_score.center,
-                    zoom=next_zoom,
-                    depth=depth + 1,
-                    cell_id=child_id,
-                    parent_cell_id=cell_id,
-                    parent_context=analysis.overall_summary,
-                    max_depth=max_depth,
-                    state=state,
-                    bbox=child_bbox,
-                )
-                if child_cells:
-                    cell.children_ids.append(child_id)
-                    all_cells.extend(child_cells)
+            # In dry_run mode, honor threshold directly (placeholder scores = 5)
+            if state.dry_run and sub_score.score < state.threshold:
+                continue
+            # In live mode, only skip confident prunes (below AMBIGUOUS_SCORE).
+            # Ambiguous cells (score 3) will get a confirmation check below.
+            if not state.dry_run and sub_score.score < AMBIGUOUS_SCORE:
+                continue
+
+            child_id = _make_cell_id(cell_id, sub_score.row, sub_score.col)
+            child_bbox = _sub_cell_bbox(bbox, sub_score.row, sub_score.col, SECTIONS)
+
+            # Ambiguous cells: fetch image and run confirmation before recursing
+            if sub_score.score == AMBIGUOUS_SCORE and not state.dry_run:
+                # Fetch the child image for confirmation
+                child_size = ground_coverage_miles(next_zoom, sub_score.center[0])
+                child_filename = _image_filename(child_id, depth + 1)
+                role = _role_for_zoom(next_zoom)
+
+                if state.api_calls >= state.max_api_calls:
+                    continue
+                if state.api_calls > 0:
+                    await asyncio.sleep(0.5)
+                provider = state.registry.get_default_provider(role)
+                child_img_path = str(state.output_dir / child_filename)
+                await provider.fetch(sub_score.center, next_zoom, child_img_path)
+                state.api_calls += 1
+
+                # Run confirmation on the fetched image
+                try:
+                    confirm_result = await confirm_fishing_water(
+                        child_img_path, analysis.overall_summary,
+                        sub_score.center, child_size,
+                    )
+                    raw_confirm = confirm_result.pop("raw_response", "")
+                    if raw_confirm:
+                        md_path = Path(child_img_path).with_name(
+                            Path(child_img_path).stem + "_confirm.md"
+                        )
+                        md_path.write_text(raw_confirm, encoding="utf-8")
+
+                    if not confirm_result.get("has_fishing_water", False):
+                        logger.info(
+                            "Ambiguous cell %s rejected by confirmation: %s",
+                            child_id, confirm_result.get("reasoning", ""),
+                        )
+                        continue  # Skip this cell
+                    logger.info("Ambiguous cell %s confirmed as fishable", child_id)
+                except Exception as e:
+                    logger.warning("Confirmation failed for %s: %s", child_id, e)
+                    continue  # Skip on error
+
+            child_cells = await _analyze_recursive(
+                center=sub_score.center,
+                zoom=next_zoom,
+                depth=depth + 1,
+                cell_id=child_id,
+                parent_cell_id=cell_id,
+                parent_context=analysis.overall_summary,
+                max_depth=max_depth,
+                state=state,
+                bbox=child_bbox,
+            )
+            if child_cells:
+                cell.children_ids.append(child_id)
+                all_cells.extend(child_cells)
 
     return all_cells

@@ -41,7 +41,7 @@ Score each zone:
   5 — YES, this cell contains fishable inshore water with natural shoreline
   0 — NO, this cell is open ocean, exposed Gulf beach, landlocked development, or inland
 
-You MUST pick 5 or 0 for every cell. No other scores. When unsure AND you can see natural shoreline with water in the cell, lean to YES. Otherwise lean to NO.
+You MUST pick 5 or 0 for every cell. No other scores. When unsure, lean to NO.
 
 MANDATORY REASONING DISCIPLINE:
 In the "reasoning" field for any cell scored 5, you MUST name a SPECIFIC visible land feature in that cell (example valid phrases: "mangrove peninsula", "barrier island", "beach/bay interface at south", "seawall with canal mouth", "tidal creek with vegetated banks"). Vague phrases like "color changes", "depth transitions", "water features", "shallow water", "visible structure", "protected waters", or "connected system" are NOT sufficient — if your only reasoning is water-based descriptions with no specific named land feature, the score MUST be 0. This prevents scoring open ocean or stitching artifacts as fishable.
