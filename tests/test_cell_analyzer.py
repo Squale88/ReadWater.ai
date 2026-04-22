@@ -306,3 +306,427 @@ def test_role_overview_at_low_zoom():
 def test_role_structure_at_high_zoom():
     for z in [16, 18, 20]:
         assert _role_for_zoom(z) == "structure"
+
+
+# --- Step 7: ancestor lineage propagation ---
+
+
+from unittest.mock import patch  # noqa: E402
+
+import pytest  # noqa: E402
+
+from readwater.api.providers.placeholder import PlaceholderProvider  # noqa: E402
+from readwater.api.providers.registry import ImageProviderRegistry  # noqa: E402
+from readwater.pipeline import cell_analyzer  # noqa: E402
+
+
+def _make_dry_run_registry():
+    registry = ImageProviderRegistry()
+    p = PlaceholderProvider(size=64)
+    registry.register(p, roles=["overview", "structure"])
+    return registry
+
+
+async def _dry_run_with_spy(tmp_path, max_depth=2, start_zoom=12):
+    """Drive analyze_cell in dry_run mode and capture every recursive call's
+    ancestor_lineage + position_in_parent via a module-level spy."""
+    registry = _make_dry_run_registry()
+    real = cell_analyzer._analyze_recursive
+    captured: list[dict] = []
+
+    async def spy(*args, **kwargs):
+        captured.append({
+            "cell_id": kwargs.get("cell_id"),
+            "depth": kwargs.get("depth"),
+            "zoom": kwargs.get("zoom"),
+            "ancestor_lineage_ids": [
+                r.cell_id for r in (kwargs.get("ancestor_lineage") or [])
+            ],
+            "ancestor_lineage_zooms": [
+                r.zoom for r in (kwargs.get("ancestor_lineage") or [])
+            ],
+            "position_in_parent": kwargs.get("position_in_parent"),
+            "ancestor_contexts_keys": list((kwargs.get("ancestor_contexts") or {}).keys()),
+        })
+        return await real(*args, **kwargs)
+
+    with patch.object(cell_analyzer, "_analyze_recursive", new=spy):
+        await cell_analyzer.analyze_cell(
+            center=MARCO,
+            registry=registry,
+            start_zoom=start_zoom,
+            threshold=4.0,
+            max_depth=max_depth,
+            dry_run=True,
+            output_dir=str(tmp_path),
+        )
+    return captured
+
+
+@pytest.mark.asyncio
+async def test_recursion_root_has_empty_lineage(tmp_path):
+    captured = await _dry_run_with_spy(tmp_path, max_depth=1, start_zoom=12)
+    root = next(c for c in captured if c["cell_id"] == "root")
+    assert root["ancestor_lineage_ids"] == []
+    assert root["ancestor_contexts_keys"] == []
+    assert root["position_in_parent"] is None
+
+
+@pytest.mark.asyncio
+async def test_recursion_depth1_children_carry_root_lineage(tmp_path):
+    captured = await _dry_run_with_spy(tmp_path, max_depth=1, start_zoom=12)
+    d1 = [c for c in captured if c["depth"] == 1]
+    assert len(d1) == 16
+    for entry in d1:
+        # Each child sees the root as its only ancestor.
+        assert entry["ancestor_lineage_ids"] == ["root"]
+        assert entry["ancestor_lineage_zooms"] == [12]
+        # Each child knows its own position in the parent.
+        row, col = entry["position_in_parent"]
+        assert 0 <= row < 4
+        assert 0 <= col < 4
+
+
+@pytest.mark.asyncio
+async def test_recursion_depth2_grandchildren_carry_two_ancestors(tmp_path):
+    captured = await _dry_run_with_spy(tmp_path, max_depth=2, start_zoom=12)
+    d2 = [c for c in captured if c["depth"] == 2]
+    # Full fanout in dry_run (all scores=5): 16 * 16 = 256.
+    assert len(d2) == 256
+    for entry in d2:
+        ids = entry["ancestor_lineage_ids"]
+        zooms = entry["ancestor_lineage_zooms"]
+        # Exactly two ancestors, root first then the z14 parent.
+        assert len(ids) == 2
+        assert ids[0] == "root"
+        assert ids[1].startswith("root-")
+        assert zooms == [12, 14]
+        assert entry["position_in_parent"] is not None
+
+
+@pytest.mark.asyncio
+async def test_recursion_position_in_parent_matches_cell_id_suffix(tmp_path):
+    """The position_in_parent (row, col) must match the cell-number suffix
+    of the child cell_id. cell_num = row*4 + col + 1."""
+    captured = await _dry_run_with_spy(tmp_path, max_depth=1, start_zoom=12)
+    for entry in (c for c in captured if c["depth"] == 1):
+        suffix = int(entry["cell_id"].rsplit("-", 1)[1])
+        row, col = entry["position_in_parent"]
+        assert row * 4 + col + 1 == suffix
+
+
+@pytest.mark.asyncio
+async def test_recursion_ancestor_contexts_is_empty_dict_in_step_7(tmp_path):
+    """Step 7 carries ancestor_contexts through but does not populate it.
+    Step 8 will fill it in."""
+    captured = await _dry_run_with_spy(tmp_path, max_depth=2, start_zoom=12)
+    for entry in captured:
+        assert entry["ancestor_contexts_keys"] == []
+
+
+# --- Step 8: build_cell_context invoked on each retained cell ---
+
+
+from readwater.models.context import CellContext  # noqa: E402
+from readwater.models.structure import StructurePhaseResult  # noqa: E402
+
+
+def _stub_grid_score_result(keep_cell_num: int = 1):
+    """Grid-scoring payload that keeps exactly one sub-cell."""
+    return {
+        "summary": "stub",
+        "hydrology_notes": "",
+        "sub_scores": [
+            {
+                "cell_number": i,
+                "score": 5 if i == keep_cell_num else 0,
+                "reasoning": "stub",
+            }
+            for i in range(1, 17)
+        ],
+        "raw_response_yes": "",
+        "raw_response_no": "",
+    }
+
+
+@pytest.fixture
+def live_recursion_patches(tmp_path):
+    """Install patches that let analyze_cell run non-dry-run without any
+    real Claude API calls. Yields a dict of recorders the test can inspect."""
+
+    build_calls: list[dict] = []
+    structure_calls: list[dict] = []
+
+    async def spy_build(**kwargs):
+        build_calls.append({
+            "cell_id": kwargs["cell_id"],
+            "zoom": kwargs["zoom"],
+            "ancestor_lineage_ids": [
+                r.cell_id for r in (kwargs.get("ancestor_lineage") or [])
+            ],
+            "ancestor_context_keys": list(
+                (kwargs.get("ancestor_contexts") or {}).keys()
+            ),
+            "grid_scoring_summary": (kwargs.get("grid_scoring_result") or {}).get("summary"),
+        })
+        return CellContext(cell_id=kwargs["cell_id"], zoom=kwargs["zoom"])
+
+    async def stub_dual_pass(*args, **kwargs):
+        return _stub_grid_score_result(keep_cell_num=1)
+
+    async def stub_run_structure(**kwargs):
+        structure_calls.append(kwargs.get("cell_id"))
+        return StructurePhaseResult(cell_id=kwargs.get("cell_id", "x"))
+
+    async def stub_confirm(*args, **kwargs):
+        return {"has_fishing_water": True, "raw_response": ""}
+
+    patchers = [
+        patch.object(cell_analyzer, "build_cell_context", new=spy_build),
+        patch.object(cell_analyzer, "dual_pass_grid_scoring", new=stub_dual_pass),
+        patch.object(cell_analyzer, "run_structure_phase", new=stub_run_structure),
+        patch.object(cell_analyzer, "confirm_fishing_water", new=stub_confirm),
+        patch.object(cell_analyzer, "draw_grid_overlay", return_value=str(tmp_path / "fake_grid.png")),
+    ]
+    for p in patchers:
+        p.start()
+    try:
+        yield {"build_calls": build_calls, "structure_calls": structure_calls}
+    finally:
+        for p in patchers:
+            p.stop()
+
+
+@pytest.mark.asyncio
+async def test_step8_build_cell_context_called_once_per_retained_cell(
+    tmp_path, live_recursion_patches,
+):
+    registry = _make_dry_run_registry()
+    cells = await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=2,
+        max_api_calls=1000,
+        dry_run=False,
+        output_dir=str(tmp_path),
+    )
+    # With only cell 1 retained at each step: root, root-1, root-1-1.
+    ids = [c.id for c in cells]
+    assert set(ids) == {"root", "root-1", "root-1-1"}
+
+    build_ids = [c["cell_id"] for c in live_recursion_patches["build_calls"]]
+    assert sorted(build_ids) == ["root", "root-1", "root-1-1"]
+
+
+@pytest.mark.asyncio
+async def test_step8_cell_context_stored_on_analysis(
+    tmp_path, live_recursion_patches,
+):
+    registry = _make_dry_run_registry()
+    cells = await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=2,
+        max_api_calls=1000,
+        dry_run=False,
+        output_dir=str(tmp_path),
+    )
+    for cell in cells:
+        assert cell.analysis is not None
+        assert cell.analysis.context is not None
+        assert cell.analysis.context.cell_id == cell.id
+        assert cell.analysis.context.zoom == cell.zoom_level
+
+
+@pytest.mark.asyncio
+async def test_step8_ancestor_contexts_propagate_to_children(
+    tmp_path, live_recursion_patches,
+):
+    registry = _make_dry_run_registry()
+    await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=2,
+        max_api_calls=1000,
+        dry_run=False,
+        output_dir=str(tmp_path),
+    )
+    calls = {c["cell_id"]: c for c in live_recursion_patches["build_calls"]}
+
+    assert calls["root"]["ancestor_context_keys"] == []
+    assert calls["root-1"]["ancestor_context_keys"] == ["root"]
+    assert set(calls["root-1-1"]["ancestor_context_keys"]) == {"root", "root-1"}
+
+
+@pytest.mark.asyncio
+async def test_step8_grid_scoring_digest_is_passed_to_build(
+    tmp_path, live_recursion_patches,
+):
+    registry = _make_dry_run_registry()
+    await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=0,
+        max_api_calls=1000,
+        dry_run=False,
+        output_dir=str(tmp_path),
+    )
+    root = live_recursion_patches["build_calls"][0]
+    # The stub dual_pass_grid_scoring returns summary="stub".
+    assert root["grid_scoring_summary"] == "stub"
+
+
+# --- Step 9: Z16 bundle written to disk at handoff ---
+
+
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from readwater.models.context import VisualRole, Z16ContextBundle  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_step9_z16_bundle_written_at_handoff(
+    tmp_path, live_recursion_patches,
+):
+    registry = _make_dry_run_registry()
+    await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=2,
+        max_api_calls=1000,
+        dry_run=False,
+        output_dir=str(tmp_path),
+    )
+    # Only root-1-1 reaches z=16 in this stub run.
+    bundle_path = tmp_path / "structures" / "root-1-1" / "context_bundle.json"
+    assert bundle_path.exists()
+    bundle = Z16ContextBundle.model_validate_json(
+        bundle_path.read_text(encoding="utf-8"),
+    )
+    # 4 visuals for a z12-start run.
+    assert set(bundle.visuals.keys()) == {
+        VisualRole.Z16_LOCAL,
+        VisualRole.Z15_SAME_CENTER,
+        VisualRole.Z14_PARENT,
+        VisualRole.Z12_GRANDPARENT,
+    }
+    # 3 context entries (root, root-1, root-1-1).
+    assert set(bundle.contexts.keys()) == {"root", "root-1", "root-1-1"}
+    # Lineage traversal order root -> parent -> self.
+    assert [r.cell_id for r in bundle.lineage] == ["root", "root-1", "root-1-1"]
+
+
+@pytest.mark.asyncio
+async def test_step9_metadata_records_bundle_path(
+    tmp_path, live_recursion_patches,
+):
+    registry = _make_dry_run_registry()
+    await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=2,
+        max_api_calls=1000,
+        dry_run=False,
+        output_dir=str(tmp_path),
+    )
+    meta_path = tmp_path / "metadata.json"
+    assert meta_path.exists()
+    entries = json.loads(meta_path.read_text(encoding="utf-8"))
+    z16_entry = next(e for e in entries if e["cell_id"] == "root-1-1")
+    assert "context_bundle_path" in z16_entry
+    assert Path(z16_entry["context_bundle_path"]).exists()
+    # Non-z16 cells do NOT record a bundle path.
+    for entry in entries:
+        if entry["cell_id"] != "root-1-1":
+            assert "context_bundle_path" not in entry
+
+
+@pytest.mark.asyncio
+async def test_step9_overlay_files_exist_for_ancestor_visuals(
+    tmp_path, live_recursion_patches,
+):
+    registry = _make_dry_run_registry()
+    await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=2,
+        max_api_calls=1000,
+        dry_run=False,
+        output_dir=str(tmp_path),
+    )
+    bundle_path = tmp_path / "structures" / "root-1-1" / "context_bundle.json"
+    bundle = Z16ContextBundle.model_validate_json(bundle_path.read_text(encoding="utf-8"))
+    # Every non-local visual has a rendered overlay on disk.
+    for role, ref in bundle.visuals.items():
+        if role == VisualRole.Z16_LOCAL:
+            assert ref.overlay_image_path is None
+        else:
+            assert ref.overlay_image_path is not None
+            assert Path(ref.overlay_image_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_step9_no_bundle_in_dry_run(tmp_path):
+    """Dry run never reaches live image fetches -> no bundle should be produced."""
+    registry = _make_dry_run_registry()
+    await cell_analyzer.analyze_cell(
+        center=MARCO,
+        registry=registry,
+        start_zoom=12,
+        max_depth=2,
+        dry_run=True,
+        output_dir=str(tmp_path),
+    )
+    assert not (tmp_path / "structures").exists()
+
+
+@pytest.mark.asyncio
+async def test_step8_failure_does_not_abort_recursion(tmp_path):
+    """If build_cell_context raises, analysis.context stays None and
+    recursion continues."""
+    registry = _make_dry_run_registry()
+
+    async def failing_build(**kwargs):
+        raise RuntimeError("boom")
+
+    async def stub_dual_pass(*args, **kwargs):
+        return _stub_grid_score_result(keep_cell_num=1)
+
+    async def stub_run_structure(**kwargs):
+        return StructurePhaseResult(cell_id=kwargs.get("cell_id", "x"))
+
+    async def stub_confirm(*args, **kwargs):
+        return {"has_fishing_water": True, "raw_response": ""}
+
+    with (
+        patch.object(cell_analyzer, "build_cell_context", new=failing_build),
+        patch.object(cell_analyzer, "dual_pass_grid_scoring", new=stub_dual_pass),
+        patch.object(cell_analyzer, "run_structure_phase", new=stub_run_structure),
+        patch.object(cell_analyzer, "confirm_fishing_water", new=stub_confirm),
+        patch.object(
+            cell_analyzer, "draw_grid_overlay",
+            return_value=str(tmp_path / "fake_grid.png"),
+        ),
+    ):
+        cells = await cell_analyzer.analyze_cell(
+            center=MARCO,
+            registry=registry,
+            start_zoom=12,
+            max_depth=1,
+            max_api_calls=1000,
+            dry_run=False,
+            output_dir=str(tmp_path),
+        )
+    # We still got both the root and its surviving child.
+    assert {c.id for c in cells} == {"root", "root-1"}
+    # Every cell's context is None because build raised.
+    for c in cells:
+        assert c.analysis.context is None

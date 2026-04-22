@@ -1,0 +1,50 @@
+Cell: {cell_id}
+Zoom: {zoom}
+Center: ({center_lat}, {center_lon})
+Coverage: ~{coverage_miles} miles per side
+
+Ancestor context (guidance, not truth):
+{ancestor_chain_block}
+
+Grid-scoring digest for this cell:
+{grid_scoring_digest}
+
+Open threads to evaluate at this zoom (may be empty):
+{open_thread_block}
+
+Return a JSON object in this exact shape. Fill the lists; leave any list empty if nothing applies:
+
+```json
+{{
+  "observations": [
+    {{"label": "mangrove_shoreline", "location_hint": "S edge", "confidence": 0.8}}
+  ],
+  "morphology": [
+    {{
+      "kind": "drains_to",
+      "statement": "The cut on the SE drains to the main channel visible at z14.",
+      "references": [],
+      "confidence": 0.6
+    }}
+  ],
+  "feature_threads": [
+    {{
+      "feature_type": "drain",
+      "status": "hypothesized",
+      "summary": "Possible drain throat on SE corner.",
+      "supporting_observations_local_idx": [0],
+      "parent_thread_id": null,
+      "needs_zoom": 18,
+      "confidence": 0.55
+    }}
+  ],
+  "open_questions": [
+    {{"question": "Does this cut have a defined throat?", "target_zoom": 18}}
+  ]
+}}
+```
+
+Notes on the shape:
+  - `supporting_observations_local_idx` is a list of 0-based indexes into YOUR `observations` list above. The caller converts them to deterministic IDs.
+  - `parent_thread_id` is the ID the caller handed you in the open-thread list; null otherwise.
+  - `references` in morphology may cite ancestor cell_ids (from the ancestor context) or observation local-idx strings like "obs:2".
