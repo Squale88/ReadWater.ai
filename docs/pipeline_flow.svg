@@ -1,0 +1,303 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1500" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f6feb"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2b8a3e"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b8530c"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="1" dy="1.5" stdDeviation="1" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <!-- Title -->
+  <rect x="0" y="0" width="1200" height="60" fill="#0b2447"/>
+  <text x="600" y="38" text-anchor="middle" font-size="22" font-weight="700" fill="#fff">
+    ReadWater.ai — Pipeline Flow
+  </text>
+  <text x="600" y="56" text-anchor="middle" font-size="11" fill="#cbd5e1">
+    Recursive Cell Analysis (coarse→fine) → Structure Phase (zoom-18 extraction)
+  </text>
+
+  <!-- Input -->
+  <g filter="url(#shadow)">
+    <rect x="470" y="90" width="260" height="50" rx="25" fill="#facc15" stroke="#92400e" stroke-width="1.5"/>
+    <text x="600" y="115" text-anchor="middle" font-size="13" font-weight="600">Region center (lat, lon)</text>
+    <text x="600" y="132" text-anchor="middle" font-size="11" fill="#555">starting zoom = 10</text>
+  </g>
+  <line x1="600" y1="140" x2="600" y2="170" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ================= PIPELINE 1 ================= -->
+  <g>
+    <rect x="40" y="170" width="1120" height="590" rx="10" fill="#e8f1ff" stroke="#1f6feb" stroke-width="2"/>
+    <rect x="40" y="170" width="1120" height="34" rx="10" fill="#1f6feb"/>
+    <text x="60" y="193" font-size="15" font-weight="700" fill="#fff">
+      PIPELINE 1 — Recursive Cell Analysis
+    </text>
+    <text x="1140" y="193" text-anchor="end" font-size="11" fill="#dbeafe" font-style="italic">
+      src/readwater/pipeline/cell_analyzer.py
+    </text>
+  </g>
+
+  <!-- zoom loop box -->
+  <g filter="url(#shadow)">
+    <rect x="500" y="220" width="200" height="44" rx="22" fill="#1f6feb" stroke="#0b3ea8" stroke-width="1.5"/>
+    <text x="600" y="247" text-anchor="middle" font-size="13" font-weight="700" fill="#fff">
+      zoom = 10 → 12 → 14 → 16
+    </text>
+  </g>
+  <line x1="600" y1="264" x2="600" y2="290" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+
+  <!-- Fetch image -->
+  <g filter="url(#shadow)">
+    <rect x="470" y="290" width="260" height="64" rx="6" fill="#fff" stroke="#1f6feb" stroke-width="1.5"/>
+    <text x="600" y="312" text-anchor="middle" font-size="13" font-weight="700">Fetch satellite image</text>
+    <text x="600" y="330" text-anchor="middle" font-size="10" fill="#555">role=overview (z&lt;16) / structure (z≥16)</text>
+    <text x="600" y="346" text-anchor="middle" font-size="10" fill="#777" font-style="italic">api/providers/registry.py</text>
+  </g>
+
+  <!-- Providers panel -->
+  <g filter="url(#shadow)">
+    <rect x="820" y="290" width="300" height="104" rx="6" fill="#fff" stroke="#64748b" stroke-width="1" stroke-dasharray="4 3"/>
+    <text x="970" y="310" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">External Providers</text>
+    <text x="840" y="330" font-size="11">• Google Static Maps</text>
+    <text x="840" y="348" font-size="11">• NAIP 4-band imagery</text>
+    <text x="840" y="366" font-size="11">• NOAA ENC (channels)</text>
+    <text x="840" y="384" font-size="11">• FWC habitat masks</text>
+  </g>
+  <line x1="730" y1="322" x2="820" y2="322" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow)"/>
+
+  <line x1="600" y1="354" x2="600" y2="380" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+
+  <!-- Dual-pass grid scoring -->
+  <g filter="url(#shadow)">
+    <rect x="440" y="380" width="320" height="70" rx="6" fill="#fff" stroke="#1f6feb" stroke-width="1.5"/>
+    <text x="600" y="404" text-anchor="middle" font-size="13" font-weight="700">Dual-pass 4×4 grid scoring</text>
+    <text x="600" y="422" text-anchor="middle" font-size="10" fill="#555">Claude vision + wider-area context image</text>
+    <text x="600" y="438" text-anchor="middle" font-size="10" fill="#777" font-style="italic">api/claude_vision.py:143</text>
+  </g>
+
+  <!-- Claude callout -->
+  <g filter="url(#shadow)">
+    <rect x="120" y="380" width="200" height="70" rx="35" fill="#fde68a" stroke="#a16207" stroke-width="1.5"/>
+    <text x="220" y="408" text-anchor="middle" font-size="13" font-weight="700">Claude vision</text>
+    <text x="220" y="426" text-anchor="middle" font-size="10" fill="#555">dual_pass_grid_scoring()</text>
+  </g>
+  <line x1="320" y1="415" x2="440" y2="415" stroke="#a16207" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow)"/>
+
+  <line x1="600" y1="450" x2="600" y2="478" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+
+  <!-- Verdict diamond -->
+  <g filter="url(#shadow)">
+    <polygon points="600,478 760,540 600,602 440,540" fill="#fef3c7" stroke="#a16207" stroke-width="1.5"/>
+    <text x="600" y="530" text-anchor="middle" font-size="12" font-weight="700">verdict?</text>
+    <text x="600" y="548" text-anchor="middle" font-size="10" fill="#555">5 keep · 3 ambiguous · 0 prune</text>
+  </g>
+
+  <!-- Prune -->
+  <line x1="440" y1="540" x2="340" y2="540" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="390" y="532" text-anchor="middle" font-size="10" fill="#b91c1c" font-weight="700">0</text>
+  <g filter="url(#shadow)">
+    <rect x="180" y="518" width="160" height="44" rx="22" fill="#fecaca" stroke="#b91c1c" stroke-width="1.5"/>
+    <text x="260" y="545" text-anchor="middle" font-size="12" font-weight="700" fill="#7f1d1d">prune cell</text>
+  </g>
+
+  <!-- Ambiguous -->
+  <line x1="760" y1="540" x2="860" y2="540" stroke="#b8530c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <text x="810" y="532" text-anchor="middle" font-size="10" fill="#b8530c" font-weight="700">3</text>
+  <g filter="url(#shadow)">
+    <rect x="860" y="518" width="200" height="44" rx="22" fill="#fed7aa" stroke="#b8530c" stroke-width="1.5"/>
+    <text x="960" y="538" text-anchor="middle" font-size="11" font-weight="700">confirm_fishing_water()</text>
+    <text x="960" y="553" text-anchor="middle" font-size="9" fill="#555">line 621</text>
+  </g>
+  <path d="M960,562 L960,590 L680,590 L680,602" fill="none" stroke="#b8530c" stroke-width="1.5" marker-end="url(#arrow-orange)"/>
+
+  <!-- Keep -->
+  <line x1="600" y1="602" x2="600" y2="628" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <text x="612" y="620" font-size="10" fill="#1f6feb" font-weight="700">5</text>
+
+  <!-- Build cell context -->
+  <g filter="url(#shadow)">
+    <rect x="420" y="628" width="360" height="64" rx="6" fill="#fff" stroke="#1f6feb" stroke-width="1.5"/>
+    <text x="600" y="650" text-anchor="middle" font-size="13" font-weight="700">build_cell_context()</text>
+    <text x="600" y="667" text-anchor="middle" font-size="10" fill="#555">observations · morphology · candidate threads</text>
+    <text x="600" y="682" text-anchor="middle" font-size="10" fill="#777" font-style="italic">pipeline/context_bundle.py</text>
+  </g>
+
+  <!-- Recurse arrow -->
+  <path d="M420,660 L80,660 L80,242 L500,242" fill="none" stroke="#1f6feb" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#arrow-blue)"/>
+  <text x="90" y="450" font-size="11" fill="#1f6feb" font-weight="700" transform="rotate(-90 90 450)">
+    recurse retained children (zoom += 2, z &lt; 16)
+  </text>
+
+  <!-- zoom==16 -->
+  <line x1="600" y1="692" x2="600" y2="718" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <g filter="url(#shadow)">
+    <rect x="440" y="718" width="320" height="34" rx="17" fill="#dcfce7" stroke="#2b8a3e" stroke-width="1.5"/>
+    <text x="600" y="740" text-anchor="middle" font-size="12" font-weight="700" fill="#14532d">
+      zoom == 16 → assemble Z16ContextBundle
+    </text>
+  </g>
+
+  <!-- Handoff -->
+  <line x1="600" y1="760" x2="600" y2="800" stroke="#2b8a3e" stroke-width="3" marker-end="url(#arrow-green)"/>
+  <text x="615" y="785" font-size="11" fill="#2b8a3e" font-weight="700">handoff</text>
+
+  <!-- ================= PIPELINE 2 ================= -->
+  <g>
+    <rect x="40" y="800" width="1120" height="630" rx="10" fill="#ecfdf5" stroke="#2b8a3e" stroke-width="2"/>
+    <rect x="40" y="800" width="1120" height="34" rx="10" fill="#2b8a3e"/>
+    <text x="60" y="823" font-size="15" font-weight="700" fill="#fff">
+      PIPELINE 2 — Structure Phase (zoom-16 → zoom-18)
+    </text>
+    <text x="1140" y="823" text-anchor="end" font-size="11" fill="#d1fae5" font-style="italic">
+      src/readwater/pipeline/structure/agent.py
+    </text>
+  </g>
+
+  <!-- DISCOVER -->
+  <g filter="url(#shadow)">
+    <rect x="440" y="854" width="320" height="60" rx="6" fill="#fff" stroke="#2b8a3e" stroke-width="1.5"/>
+    <text x="600" y="876" text-anchor="middle" font-size="13" font-weight="700">DISCOVER anchors</text>
+    <text x="600" y="893" text-anchor="middle" font-size="10" fill="#555">Claude on z16 + z15 context imagery</text>
+    <text x="600" y="907" text-anchor="middle" font-size="10" fill="#777" font-style="italic">structure/prompts.py</text>
+  </g>
+
+  <!-- Evidence layers -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="850" width="300" height="108" rx="6" fill="#fff" stroke="#64748b" stroke-width="1" stroke-dasharray="4 3"/>
+    <text x="230" y="870" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">Evidence masks</text>
+    <text x="100" y="890" font-size="11">• water_mask.py · polygon_mask.py</text>
+    <text x="100" y="908" font-size="11">• NOAA ENC channels</text>
+    <text x="100" y="926" font-size="11">• FWC oyster / seagrass</text>
+    <text x="100" y="944" font-size="11">• NAIP 4-band NDWI</text>
+  </g>
+  <line x1="380" y1="884" x2="440" y2="884" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow)"/>
+
+  <line x1="600" y1="914" x2="600" y2="940" stroke="#2b8a3e" stroke-width="2" marker-end="url(#arrow-green)"/>
+
+  <!-- RANK_AND_DEFER -->
+  <g filter="url(#shadow)">
+    <rect x="440" y="940" width="320" height="44" rx="6" fill="#fff" stroke="#2b8a3e" stroke-width="1.5"/>
+    <text x="600" y="967" text-anchor="middle" font-size="13" font-weight="700">RANK_AND_DEFER</text>
+  </g>
+
+  <line x1="600" y1="984" x2="600" y2="1010" stroke="#2b8a3e" stroke-width="2" marker-end="url(#arrow-green)"/>
+
+  <!-- Per-anchor loop -->
+  <g>
+    <rect x="80" y="1010" width="1040" height="340" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5" stroke-dasharray="8 4"/>
+    <text x="110" y="1030" font-size="12" font-weight="700" fill="#166534">per anchor loop  (budget: 15 Claude calls / 25 tiles)</text>
+  </g>
+
+  <!-- Stages row 1 -->
+  <g filter="url(#shadow)">
+    <rect x="110" y="1050" width="170" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="195" y="1072" text-anchor="middle" font-size="12" font-weight="700">PLAN_CAPTURE</text>
+    <text x="195" y="1090" text-anchor="middle" font-size="9" fill="#555">select_z18_centers()</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="300" y="1050" width="170" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="385" y="1072" text-anchor="middle" font-size="12" font-weight="700">FETCH</text>
+    <text x="385" y="1090" text-anchor="middle" font-size="9" fill="#555">Mosaic stitch z18 tiles</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="490" y="1050" width="210" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="595" y="1072" text-anchor="middle" font-size="12" font-weight="700">RESOLVE_CONTINUATION</text>
+    <text x="595" y="1090" text-anchor="middle" font-size="9" fill="#555">expand grid if off-frame</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="720" y="1050" width="170" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="805" y="1072" text-anchor="middle" font-size="12" font-weight="700">IDENTIFY</text>
+    <text x="805" y="1090" text-anchor="middle" font-size="9" fill="#555">Claude grid-cell picks</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="910" y="1050" width="190" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="1005" y="1072" text-anchor="middle" font-size="12" font-weight="700">VALIDATE_CELLS</text>
+    <text x="1005" y="1090" text-anchor="middle" font-size="9" fill="#555">seed_validator.py</text>
+  </g>
+
+  <line x1="280" y1="1077" x2="300" y2="1077" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="470" y1="1077" x2="490" y2="1077" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="700" y1="1077" x2="720" y2="1077" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="890" y1="1077" x2="910" y2="1077" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <!-- loop-back arrow for continuation -->
+  <path d="M595,1050 L595,1034 L385,1034 L385,1050" fill="none" stroke="#16a34a" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arrow-green)"/>
+  <text x="490" y="1028" text-anchor="middle" font-size="9" fill="#166534" font-style="italic">if needs more tiles</text>
+
+  <!-- Row 2 -->
+  <g filter="url(#shadow)">
+    <rect x="110" y="1130" width="170" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="195" y="1152" text-anchor="middle" font-size="12" font-weight="700">EXTRACT</text>
+    <text x="195" y="1170" text-anchor="middle" font-size="9" fill="#555">GridCellExtractor</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="300" y="1130" width="200" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="400" y="1152" text-anchor="middle" font-size="12" font-weight="700">IDENTIFY_SUBZONES</text>
+    <text x="400" y="1170" text-anchor="middle" font-size="9" fill="#555">fishable targets</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="520" y="1130" width="200" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="620" y="1152" text-anchor="middle" font-size="12" font-weight="700">VALIDATE &amp; EXTRACT</text>
+    <text x="620" y="1170" text-anchor="middle" font-size="9" fill="#555">subzone polygons</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="740" y="1130" width="170" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="825" y="1152" text-anchor="middle" font-size="12" font-weight="700">INTERPRET</text>
+    <text x="825" y="1170" text-anchor="middle" font-size="9" fill="#555">influence zones</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="930" y="1130" width="170" height="54" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="1015" y="1152" text-anchor="middle" font-size="12" font-weight="700">ASSEMBLE</text>
+    <text x="1015" y="1170" text-anchor="middle" font-size="9" fill="#555">AnchorStructure</text>
+  </g>
+
+  <!-- Flow arrows row 1 → row 2 -->
+  <path d="M1005,1104 L1005,1118 L195,1118 L195,1130" fill="none" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="280" y1="1157" x2="300" y2="1157" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="500" y1="1157" x2="520" y2="1157" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="720" y1="1157" x2="740" y2="1157" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="910" y1="1157" x2="930" y2="1157" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <!-- Assemble outputs -->
+  <g filter="url(#shadow)">
+    <rect x="200" y="1220" width="820" height="110" rx="6" fill="#fff" stroke="#16a34a" stroke-width="1.2"/>
+    <text x="610" y="1245" text-anchor="middle" font-size="12" font-weight="700" fill="#166534">Assembled models (src/readwater/models/structure.py)</text>
+    <text x="230" y="1270" font-size="11">◆ AnchorStructure — primary feature + member cells</text>
+    <text x="230" y="1290" font-size="11">◆ MemberFeature — supporting cells within the complex</text>
+    <text x="230" y="1310" font-size="11">◆ InfluenceZone — interpreted current/tide influence envelope</text>
+    <text x="630" y="1270" font-size="11">◆ FishableSubzone — target cells with fishing relevance</text>
+    <text x="630" y="1290" font-size="11">◆ LocalComplex — grouped anchors sharing context</text>
+    <text x="630" y="1310" font-size="11">◆ StructurePhaseResult — full anchor registry</text>
+  </g>
+  <line x1="1015" y1="1184" x2="1015" y2="1210" stroke="#16a34a" stroke-width="1.5"/>
+  <line x1="1015" y1="1210" x2="610" y2="1210" stroke="#16a34a" stroke-width="1.5"/>
+  <line x1="610" y1="1210" x2="610" y2="1220" stroke="#16a34a" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <!-- FINALIZE -->
+  <line x1="600" y1="1350" x2="600" y2="1376" stroke="#2b8a3e" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <g filter="url(#shadow)">
+    <rect x="360" y="1376" width="480" height="44" rx="6" fill="#bbf7d0" stroke="#166534" stroke-width="1.5"/>
+    <text x="600" y="1403" text-anchor="middle" font-size="13" font-weight="700" fill="#14532d">
+      FINALIZE → registry.json · deferred · overlap reports
+    </text>
+  </g>
+
+  <!-- Output -->
+  <line x1="600" y1="1420" x2="600" y2="1446" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+  <g filter="url(#shadow)">
+    <rect x="310" y="1446" width="580" height="44" rx="22" fill="#facc15" stroke="#92400e" stroke-width="1.5"/>
+    <text x="600" y="1473" text-anchor="middle" font-size="12" font-weight="700">
+      data/areas/{area}/images/cells/{cell_id}/structures/
+    </text>
+  </g>
+</svg>
