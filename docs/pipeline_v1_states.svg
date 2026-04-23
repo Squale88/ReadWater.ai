@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f6feb"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b8530c"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2b8a3e"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="1" dy="1.5" stdDeviation="1" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <!-- Title -->
+  <rect x="0" y="0" width="1200" height="60" fill="#0b2447"/>
+  <text x="600" y="34" text-anchor="middle" font-size="20" font-weight="700" fill="#fff">
+    Object State Machine — v1
+  </text>
+  <text x="600" y="52" text-anchor="middle" font-size="11" fill="#cbd5e1">
+    Every structured object (Cell · Bundle · Anchor · Member · Subzone · InfluenceZone) flows through the same states
+  </text>
+
+  <!-- Entry -->
+  <g filter="url(#shadow)">
+    <circle cx="100" cy="260" r="30" fill="#0b2447"/>
+    <text x="100" y="265" text-anchor="middle" font-size="11" font-weight="700" fill="#fff">emit</text>
+  </g>
+  <text x="100" y="310" text-anchor="middle" font-size="10" fill="#64748b">by A · B · C · D</text>
+
+  <line x1="130" y1="260" x2="218" y2="260" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+
+  <!-- draft -->
+  <g filter="url(#shadow)">
+    <rect x="220" y="220" width="160" height="80" rx="12" fill="#dbeafe" stroke="#1f6feb" stroke-width="2"/>
+    <text x="300" y="250" text-anchor="middle" font-size="15" font-weight="700" fill="#1f6feb">draft</text>
+    <text x="300" y="268" text-anchor="middle" font-size="10" fill="#334155">phase_history populated</text>
+    <text x="300" y="284" text-anchor="middle" font-size="10" fill="#334155">provenance attached</text>
+  </g>
+
+  <line x1="380" y1="260" x2="498" y2="260" stroke="#b8530c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <text x="439" y="248" text-anchor="middle" font-size="11" font-weight="700" fill="#b8530c">Phase E</text>
+  <text x="439" y="278" text-anchor="middle" font-size="9" fill="#7c2d12" font-style="italic">schema · geom · evidence</text>
+
+  <!-- validated -->
+  <g filter="url(#shadow)">
+    <rect x="500" y="220" width="180" height="80" rx="12" fill="#fed7aa" stroke="#b8530c" stroke-width="2"/>
+    <text x="590" y="250" text-anchor="middle" font-size="15" font-weight="700" fill="#7c2d12">validated</text>
+    <text x="590" y="268" text-anchor="middle" font-size="10" fill="#7c2d12">findings attached</text>
+    <text x="590" y="284" text-anchor="middle" font-size="10" fill="#7c2d12">non-blocking</text>
+  </g>
+
+  <!-- branch to approved -->
+  <path d="M680,240 C770,240 820,160 898,160" fill="none" stroke="#2b8a3e" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <text x="790" y="190" text-anchor="middle" font-size="11" font-weight="700" fill="#166534">Phase G · accept</text>
+
+  <!-- branch to rejected -->
+  <path d="M680,280 C770,280 820,360 898,360" fill="none" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow-red)"/>
+  <text x="790" y="336" text-anchor="middle" font-size="11" font-weight="700" fill="#b91c1c">Phase G · reject</text>
+
+  <!-- approved -->
+  <g filter="url(#shadow)">
+    <rect x="900" y="120" width="200" height="80" rx="12" fill="#bbf7d0" stroke="#2b8a3e" stroke-width="2.5"/>
+    <text x="1000" y="150" text-anchor="middle" font-size="15" font-weight="700" fill="#14532d">approved</text>
+    <text x="1000" y="170" text-anchor="middle" font-size="10" fill="#166534">terminal · v1 output</text>
+    <text x="1000" y="186" text-anchor="middle" font-size="10" fill="#166534">substructures inherit</text>
+  </g>
+
+  <!-- rejected -->
+  <g filter="url(#shadow)">
+    <rect x="900" y="320" width="200" height="80" rx="12" fill="#fecaca" stroke="#b91c1c" stroke-width="2.5"/>
+    <text x="1000" y="350" text-anchor="middle" font-size="15" font-weight="700" fill="#7f1d1d">rejected</text>
+    <text x="1000" y="370" text-anchor="middle" font-size="10" fill="#7f1d1d">terminal · substructures drop</text>
+    <text x="1000" y="386" text-anchor="middle" font-size="10" fill="#7f1d1d">no auto rerun (v1)</text>
+  </g>
+
+  <!-- Cross-cutting fields panel -->
+  <g>
+    <rect x="60" y="450" width="1080" height="260" rx="8" fill="#f8fafc" stroke="#475569" stroke-width="1.2"/>
+    <text x="80" y="478" font-size="14" font-weight="700" fill="#334155">Cross-cutting fields on every object</text>
+
+    <g filter="url(#shadow)">
+      <rect x="80" y="494" width="246" height="190" rx="6" fill="#fff" stroke="#475569" stroke-width="1"/>
+      <text x="203" y="516" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">state</text>
+      <text x="100" y="538" font-size="10" fill="#334155">• draft (emitted)</text>
+      <text x="100" y="554" font-size="10" fill="#334155">• validated (after E)</text>
+      <text x="100" y="570" font-size="10" fill="#334155">• approved (after G accept)</text>
+      <text x="100" y="586" font-size="10" fill="#334155">• rejected (after G reject)</text>
+      <text x="100" y="616" font-size="10" fill="#334155" font-style="italic">single-field state machine</text>
+      <text x="100" y="632" font-size="10" fill="#334155" font-style="italic">terminal at approved/rejected</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="340" y="494" width="246" height="190" rx="6" fill="#fff" stroke="#475569" stroke-width="1"/>
+      <text x="463" y="516" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">phase_history</text>
+      <text x="360" y="538" font-size="10" fill="#334155">ordered append-only log:</text>
+      <text x="360" y="558" font-size="10" fill="#334155">• phase id</text>
+      <text x="360" y="574" font-size="10" fill="#334155">• timestamp</text>
+      <text x="360" y="590" font-size="10" fill="#334155">• action (emit / validate /</text>
+      <text x="360" y="606" font-size="10" fill="#334155">  accept / reject / rerun)</text>
+      <text x="360" y="626" font-size="10" fill="#334155">• actor (system · user_id)</text>
+      <text x="360" y="642" font-size="10" fill="#334155">• notes</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="600" y="494" width="246" height="190" rx="6" fill="#fff" stroke="#475569" stroke-width="1"/>
+      <text x="723" y="516" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">provenance</text>
+      <text x="620" y="538" font-size="10" fill="#334155">• source imagery refs</text>
+      <text x="620" y="554" font-size="10" fill="#334155">• overlay refs (NOAA/FWC/NAIP)</text>
+      <text x="620" y="570" font-size="10" fill="#334155">• prompt id + version</text>
+      <text x="620" y="586" font-size="10" fill="#334155">• provider config</text>
+      <text x="620" y="602" font-size="10" fill="#334155">• input hash (for future cache)</text>
+      <text x="620" y="626" font-size="10" fill="#334155" font-style="italic">hash-addressable outputs;</text>
+      <text x="620" y="642" font-size="10" fill="#334155" font-style="italic">caching deferred post-v1</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="860" y="494" width="260" height="190" rx="6" fill="#fff" stroke="#475569" stroke-width="1"/>
+      <text x="990" y="516" text-anchor="middle" font-size="12" font-weight="700" fill="#334155">findings[]</text>
+      <text x="880" y="538" font-size="10" fill="#334155">attached by Phase E:</text>
+      <text x="880" y="558" font-size="10" fill="#334155">• issue_code · severity</text>
+      <text x="880" y="574" font-size="10" fill="#334155">• object_id · field</text>
+      <text x="880" y="590" font-size="10" fill="#334155">• message</text>
+      <text x="880" y="606" font-size="10" fill="#334155">• recommended_action (advisory)</text>
+      <text x="880" y="626" font-size="10" fill="#334155" font-style="italic">travel with object into G;</text>
+      <text x="880" y="642" font-size="10" fill="#334155" font-style="italic">displayed to reviewer</text>
+    </g>
+  </g>
+
+  <!-- Silent reinterpretation note -->
+  <g>
+    <rect x="60" y="720" width="1080" height="30" rx="4" fill="#fef3c7" stroke="#a16207" stroke-width="1"/>
+    <text x="80" y="740" font-size="11" fill="#78350f">
+      <tspan font-weight="700">Silent reinterpretation rule:</tspan>
+      anchor.id · anchor.type · anchor.center · parent_anchor_id · geometry.extent are immutable after emission unless a recorded event changes them.
+    </text>
+  </g>
+</svg>
