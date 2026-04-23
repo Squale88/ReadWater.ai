@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1640" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f6feb"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b8530c"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2b8a3e"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="1" dy="1.5" stdDeviation="1" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+
+  <!-- Title -->
+  <rect x="0" y="0" width="1200" height="64" fill="#0b2447"/>
+  <text x="600" y="34" text-anchor="middle" font-size="22" font-weight="700" fill="#fff">
+    ReadWater.ai — v1 Operational Flow
+  </text>
+  <text x="600" y="54" text-anchor="middle" font-size="12" fill="#cbd5e1">
+    A → B → E → C → E → D → E → G  ·  forward-only, no automatic reruns
+  </text>
+
+  <!-- Legend -->
+  <g font-size="11">
+    <rect x="40" y="82" width="14" height="14" fill="#dbeafe" stroke="#1f6feb"/>
+    <text x="60" y="94">Generation phase (Claude)</text>
+    <rect x="220" y="82" width="14" height="14" fill="#fed7aa" stroke="#b8530c"/>
+    <text x="240" y="94">Validation gate (pure, rules)</text>
+    <rect x="420" y="82" width="14" height="14" fill="#bbf7d0" stroke="#2b8a3e"/>
+    <text x="440" y="94">Human gate</text>
+    <rect x="540" y="82" width="14" height="14" fill="#facc15" stroke="#92400e"/>
+    <text x="560" y="94">Input / output</text>
+    <rect x="660" y="82" width="14" height="14" fill="#e5e7eb" stroke="#6b7280"/>
+    <text x="680" y="94">Deferred post-v1</text>
+  </g>
+
+  <!-- Input -->
+  <g filter="url(#shadow)">
+    <rect x="440" y="118" width="320" height="46" rx="23" fill="#facc15" stroke="#92400e" stroke-width="1.5"/>
+    <text x="600" y="140" text-anchor="middle" font-size="13" font-weight="700">Region center + starting zoom (10 or 12)</text>
+    <text x="600" y="156" text-anchor="middle" font-size="10" fill="#555">grid defs · discovery prompts · exclusion rules</text>
+  </g>
+  <line x1="600" y1="164" x2="600" y2="192" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Phase A -->
+  <g filter="url(#shadow)">
+    <rect x="300" y="192" width="600" height="86" rx="8" fill="#dbeafe" stroke="#1f6feb" stroke-width="2"/>
+    <text x="320" y="214" font-size="14" font-weight="700" fill="#1f6feb">Phase A — Recursive Discovery</text>
+    <text x="320" y="234" font-size="11" fill="#334155">Recursive grid scoring z10/12 → z16. Parent-context threaded into child scoring.</text>
+    <text x="320" y="250" font-size="11" fill="#334155">Prunes residential canals, retention ponds, irrelevant inland water.</text>
+    <text x="320" y="268" font-size="10" fill="#64748b" font-style="italic">emits Cell[] with lineage (state = draft)</text>
+  </g>
+
+  <line x1="600" y1="278" x2="600" y2="308" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+  <text x="614" y="296" font-size="10" fill="#1f6feb" font-style="italic">qualified z16 cells</text>
+
+  <!-- Phase B -->
+  <g filter="url(#shadow)">
+    <rect x="300" y="308" width="600" height="100" rx="8" fill="#dbeafe" stroke="#1f6feb" stroke-width="2"/>
+    <text x="320" y="330" font-size="14" font-weight="700" fill="#1f6feb">Phase B — Context Assembly</text>
+    <text x="320" y="350" font-size="11" fill="#334155">Normalizes z16 + ancestor imagery, discovery notes, overlays (NOAA/FWC/NAIP).</text>
+    <text x="320" y="366" font-size="11" fill="#334155">Tags every field as known_fact or inference. Preserves provenance and raw refs.</text>
+    <text x="320" y="384" font-size="10" fill="#64748b" font-style="italic">emits Z16ContextBundle (state = draft)</text>
+  </g>
+
+  <line x1="600" y1="408" x2="600" y2="438" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+
+  <!-- Validation gate 1 -->
+  <g filter="url(#shadow)">
+    <rect x="360" y="438" width="480" height="56" rx="28" fill="#fed7aa" stroke="#b8530c" stroke-width="2"/>
+    <text x="600" y="460" text-anchor="middle" font-size="13" font-weight="700" fill="#7c2d12">
+      Phase E₁ — Validate Z16ContextBundle
+    </text>
+    <text x="600" y="478" text-anchor="middle" font-size="10" fill="#7c2d12">
+      schema · required fields · provenance · overlay alignment · known_fact tagging
+    </text>
+  </g>
+
+  <line x1="600" y1="494" x2="600" y2="524" stroke="#b8530c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <text x="614" y="514" font-size="10" fill="#b8530c" font-style="italic">bundle state → validated (findings attached, non-blocking)</text>
+
+  <!-- Phase C -->
+  <g filter="url(#shadow)">
+    <rect x="300" y="524" width="600" height="100" rx="8" fill="#dbeafe" stroke="#1f6feb" stroke-width="2"/>
+    <text x="320" y="546" font-size="14" font-weight="700" fill="#1f6feb">Phase C — Anchor Identification</text>
+    <text x="320" y="566" font-size="11" fill="#334155">Identifies dominant z16 organizing structures. Rough center, extent, priority.</text>
+    <text x="320" y="582" font-size="11" fill="#334155">Emits a <tspan font-weight="700">seed</tspan> Z18 fetch plan per anchor (not defensively over-fetched).</text>
+    <text x="320" y="600" font-size="10" fill="#64748b" font-style="italic">emits AnchorStructure[] + Z18FetchPlan[] (state = draft)</text>
+  </g>
+
+  <line x1="600" y1="624" x2="600" y2="654" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+
+  <!-- Validation gate 2 -->
+  <g filter="url(#shadow)">
+    <rect x="360" y="654" width="480" height="56" rx="28" fill="#fed7aa" stroke="#b8530c" stroke-width="2"/>
+    <text x="600" y="676" text-anchor="middle" font-size="13" font-weight="700" fill="#7c2d12">
+      Phase E₂ — Validate Anchors
+    </text>
+    <text x="600" y="694" text-anchor="middle" font-size="10" fill="#7c2d12">
+      anchor center inside cell · extent plausible · required evidence · fetch plan sanity
+    </text>
+  </g>
+
+  <line x1="600" y1="710" x2="600" y2="740" stroke="#b8530c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <text x="614" y="730" font-size="10" fill="#b8530c" font-style="italic">anchor state → validated</text>
+
+  <!-- Phase D -->
+  <g filter="url(#shadow)">
+    <rect x="300" y="740" width="600" height="128" rx="8" fill="#dbeafe" stroke="#1f6feb" stroke-width="2"/>
+    <text x="320" y="762" font-size="14" font-weight="700" fill="#1f6feb">Phase D — Structure Decomposition</text>
+    <text x="320" y="782" font-size="11" fill="#334155">Executes seed z18 fetch plan per anchor. Mosaics z18 tiles.</text>
+    <text x="320" y="798" font-size="11" fill="#334155">Identifies members, subzones, influence zones. Every object tied to parent anchor.</text>
+    <text x="320" y="814" font-size="11" fill="#334155">
+      Bounded tile-plan expansion allowed when anchor runs off-frame (logged in phase_history).
+    </text>
+    <text x="320" y="832" font-size="11" fill="#334155">If D disagrees with anchor identity, it raises a finding — does not mutate the anchor.</text>
+    <text x="320" y="852" font-size="10" fill="#64748b" font-style="italic">
+      emits LocalComplex · InfluenceZone[] · FishableSubzone[] · MemberFeature[] (state = draft)
+    </text>
+  </g>
+  <!-- D internal expansion loop indicator -->
+  <path d="M905,790 C970,790 970,830 905,830" fill="none" stroke="#1f6feb" stroke-width="1.3" stroke-dasharray="4 3" marker-end="url(#arrow-blue)"/>
+  <text x="980" y="812" font-size="9" fill="#1f6feb">bounded</text>
+  <text x="980" y="826" font-size="9" fill="#1f6feb">tile expand</text>
+
+  <line x1="600" y1="868" x2="600" y2="898" stroke="#1f6feb" stroke-width="2" marker-end="url(#arrow-blue)"/>
+
+  <!-- Validation gate 3 -->
+  <g filter="url(#shadow)">
+    <rect x="360" y="898" width="480" height="56" rx="28" fill="#fed7aa" stroke="#b8530c" stroke-width="2"/>
+    <text x="600" y="920" text-anchor="middle" font-size="13" font-weight="700" fill="#7c2d12">
+      Phase E₃ — Validate Decomposition
+    </text>
+    <text x="600" y="938" text-anchor="middle" font-size="10" fill="#7c2d12">
+      parent-child resolves · no orphans · geometry sanity · extent inside anchor
+    </text>
+  </g>
+
+  <line x1="600" y1="954" x2="600" y2="984" stroke="#b8530c" stroke-width="2" marker-end="url(#arrow-orange)"/>
+  <text x="614" y="974" font-size="10" fill="#b8530c" font-style="italic">all objects → validated + findings attached</text>
+
+  <!-- Phase G -->
+  <g filter="url(#shadow)">
+    <rect x="300" y="984" width="600" height="124" rx="8" fill="#bbf7d0" stroke="#2b8a3e" stroke-width="2"/>
+    <text x="320" y="1006" font-size="14" font-weight="700" fill="#166534">Phase G — Human Correction (minimal)</text>
+    <text x="320" y="1026" font-size="11" fill="#334155">Per-anchor accept / reject only. No geometry edits, no merge/split in v1.</text>
+    <text x="320" y="1042" font-size="11" fill="#334155">UI shows: anchor, substructures, imagery, overlays, Phase E findings, provenance.</text>
+    <text x="320" y="1060" font-size="11" fill="#334155">Reject → substructures drop with anchor. Accept → substructures inherit approval.</text>
+    <text x="320" y="1080" font-size="11" fill="#334155">Reviewer may add a free-text note; decision is timestamped and attributed.</text>
+    <text x="320" y="1098" font-size="10" fill="#64748b" font-style="italic">
+      emits DecisionRecord per anchor; state → approved | rejected
+    </text>
+  </g>
+
+  <!-- Accept / reject branches -->
+  <line x1="470" y1="1108" x2="470" y2="1148" stroke="#2b8a3e" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <text x="486" y="1134" font-size="11" fill="#166534" font-weight="700">accept</text>
+  <line x1="730" y1="1108" x2="730" y2="1148" stroke="#b91c1c" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="746" y="1134" font-size="11" fill="#b91c1c" font-weight="700">reject</text>
+
+  <g filter="url(#shadow)">
+    <rect x="320" y="1148" width="300" height="54" rx="8" fill="#dcfce7" stroke="#166534" stroke-width="1.5"/>
+    <text x="470" y="1170" text-anchor="middle" font-size="12" font-weight="700" fill="#14532d">approved (terminal)</text>
+    <text x="470" y="1188" text-anchor="middle" font-size="10" fill="#166534">anchor + all substructures</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="580" y="1148" width="300" height="54" rx="8" fill="#fecaca" stroke="#b91c1c" stroke-width="1.5"/>
+    <text x="730" y="1170" text-anchor="middle" font-size="12" font-weight="700" fill="#7f1d1d">rejected (terminal)</text>
+    <text x="730" y="1188" text-anchor="middle" font-size="10" fill="#7f1d1d">substructures drop · no auto rerun</text>
+  </g>
+
+  <!-- Output -->
+  <line x1="470" y1="1202" x2="600" y2="1236" stroke="#2b8a3e" stroke-width="2" marker-end="url(#arrow-green)"/>
+  <g filter="url(#shadow)">
+    <rect x="290" y="1236" width="620" height="54" rx="27" fill="#facc15" stroke="#92400e" stroke-width="1.5"/>
+    <text x="600" y="1258" text-anchor="middle" font-size="13" font-weight="700">v1 output</text>
+    <text x="600" y="1276" text-anchor="middle" font-size="11">human-approved structured knowledge · filesystem JSON under data/areas/{area}/</text>
+  </g>
+
+  <!-- Deferred section -->
+  <g>
+    <rect x="40" y="1316" width="1120" height="180" rx="8" fill="#f9fafb" stroke="#6b7280" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="60" y="1340" font-size="13" font-weight="700" fill="#374151">Deferred post-v1</text>
+
+    <g filter="url(#shadow)">
+      <rect x="70" y="1354" width="340" height="128" rx="6" fill="#e5e7eb" stroke="#6b7280" stroke-width="1.2"/>
+      <text x="240" y="1378" text-anchor="middle" font-size="13" font-weight="700" fill="#374151">Phase F — Editorial Audit</text>
+      <text x="90" y="1398" font-size="10" fill="#374151">cross-object reconciliation</text>
+      <text x="90" y="1414" font-size="10" fill="#374151">duplication / overlap detection</text>
+      <text x="90" y="1430" font-size="10" fill="#374151">normalized labeling</text>
+      <text x="90" y="1446" font-size="10" fill="#374151">plausibility review</text>
+      <text x="90" y="1462" font-size="10" fill="#374151" font-style="italic">runs between E and G</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="430" y="1354" width="340" height="128" rx="6" fill="#e5e7eb" stroke="#6b7280" stroke-width="1.2"/>
+      <text x="600" y="1378" text-anchor="middle" font-size="13" font-weight="700" fill="#374151">Phase H — Assessment / Tagging</text>
+      <text x="450" y="1398" font-size="10" fill="#374151">condition-independent tags</text>
+      <text x="450" y="1414" font-size="10" fill="#374151">tide stage · wind octant · season</text>
+      <text x="450" y="1430" font-size="10" fill="#374151">per-tag confidence + strength</text>
+      <text x="450" y="1446" font-size="10" fill="#374151">controlled vocabulary required</text>
+      <text x="450" y="1462" font-size="10" fill="#374151" font-style="italic">feeds planning engine queries</text>
+    </g>
+
+    <g filter="url(#shadow)">
+      <rect x="790" y="1354" width="340" height="128" rx="6" fill="#e5e7eb" stroke="#6b7280" stroke-width="1.2"/>
+      <text x="960" y="1378" text-anchor="middle" font-size="13" font-weight="700" fill="#374151">Phase I — Publish</text>
+      <text x="810" y="1398" font-size="10" fill="#374151">state promotion to published</text>
+      <text x="810" y="1414" font-size="10" fill="#374151">versioned planning-engine payloads</text>
+      <text x="810" y="1430" font-size="10" fill="#374151">publish gating rules</text>
+      <text x="810" y="1446" font-size="10" fill="#374151">traceability to source + decisions</text>
+      <text x="810" y="1462" font-size="10" fill="#374151" font-style="italic">gates downstream consumption</text>
+    </g>
+  </g>
+
+  <!-- Forward-only note -->
+  <g>
+    <rect x="40" y="1528" width="1120" height="80" rx="6" fill="#fef3c7" stroke="#a16207" stroke-width="1"/>
+    <text x="60" y="1552" font-size="12" font-weight="700" fill="#78350f">v1 rules</text>
+    <text x="60" y="1572" font-size="11" fill="#78350f">• Forward-only: no automatic reruns. Rejected anchors drop; human re-runs C/D manually if a corrected version is wanted.</text>
+    <text x="60" y="1590" font-size="11" fill="#78350f">• Phase E is pure: emits findings, never mutates. Findings are non-blocking and travel with the object into Phase G.</text>
+  </g>
+</svg>
