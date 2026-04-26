@@ -232,3 +232,54 @@ def _pct(frac: float) -> str:
     if pct == 0:  # fractional but rounds to 0
         return "<1%"
     return f"{pct}%"
+
+
+# --- Per-cell convenience entry point used by anchor_discovery / harnesses ---
+
+
+def _default_mask_paths(cell_id: str, area_root: Path) -> dict[str, Path]:
+    """Standard per-cell mask layout under data/areas/<area>_<layer>/.
+
+    Convention from the existing data:
+      data/areas/<area>_naip/<cell_id>_water_mask.png
+      data/areas/<area>_channels/<cell_id>_channel_mask.png
+      data/areas/<area>_habitats/<cell_id>_oyster_mask.png
+      data/areas/<area>_habitats/<cell_id>_seagrass_mask.png
+    """
+    base = area_root.parent
+    area_name = area_root.name
+    return {
+        "water": base / f"{area_name}_naip" / f"{cell_id}_water_mask.png",
+        "channel": base / f"{area_name}_channels" / f"{cell_id}_channel_mask.png",
+        "oyster": base / f"{area_name}_habitats" / f"{cell_id}_oyster_mask.png",
+        "seagrass": base / f"{area_name}_habitats" / f"{cell_id}_seagrass_mask.png",
+    }
+
+
+def build_cell_evidence_section(
+    cell_id: str,
+    area_root: Path,
+    grid_rows: int = 8,
+    grid_cols: int = 8,
+    image_size: tuple[int, int] = (1280, 1280),
+    mask_paths: dict[str, Path] | None = None,
+) -> str:
+    """Find this cell's habitat masks on disk and produce a prompt-ready section.
+
+    Returns a placeholder string if no mask files were found, so the caller
+    can always pass the result into a prompt template that has an
+    `{evidence_table}` placeholder.
+
+    Pass `mask_paths` explicitly to override the default layout (useful for
+    tests / non-standard layouts).
+    """
+    if mask_paths is None:
+        candidates = _default_mask_paths(cell_id, area_root)
+    else:
+        candidates = mask_paths
+    found = {layer: str(p) for layer, p in candidates.items() if Path(p).exists()}
+    if not found:
+        return f"(no habitat evidence masks found for {cell_id})"
+    table = build_evidence_table(found, grid_rows=grid_rows,
+                                 grid_cols=grid_cols, image_size=image_size)
+    return format_evidence_for_prompt(table)

@@ -10,7 +10,7 @@ from readwater.api.claude_vision import (
     _cell_number_to_row_col,
     _extract_json_from_response,
     analyze_grid_image,
-    analyze_structure_image,
+    # analyze_structure_image deleted by Phase C TASK-7 (legacy, no live callers)
     generate_cell_context,
 )
 from readwater.api.providers.placeholder import PlaceholderProvider
@@ -163,34 +163,12 @@ async def test_grid_image_sends_image(tmp_path):
 
 
 # --- analyze_structure_image ---
-
-
-async def test_structure_image_returns_features(tmp_path):
-    src = str(tmp_path / "test.png")
-    await PlaceholderProvider(size=64).fetch(MARCO, 18, src)
-
-    mock_client = _make_mock_client(_mock_structure_response())
-    with patch("readwater.api.claude_vision._get_client", return_value=mock_client):
-        result = await analyze_structure_image(src, "Shallow bay area", MARCO, 0.21)
-
-    assert result["summary"] == "Productive grass flat"
-    assert len(result["fishable_features"]) == 1
-    assert result["fishable_features"][0]["feature_type"] == "grass_flat"
-    assert result["overall_rating"] == 7.5
-
-
-async def test_structure_image_includes_context(tmp_path):
-    src = str(tmp_path / "test.png")
-    await PlaceholderProvider(size=64).fetch(MARCO, 18, src)
-
-    mock_client = _make_mock_client(_mock_structure_response())
-    with patch("readwater.api.claude_vision._get_client", return_value=mock_client):
-        await analyze_structure_image(src, "Near oyster bar complex", MARCO, 0.21)
-
-    call_args = mock_client.messages.create.call_args
-    user_content = call_args.kwargs["messages"][0]["content"]
-    text_block = next(b for b in user_content if b["type"] == "text")
-    assert "Near oyster bar complex" in text_block["text"]
+#
+# Tests removed by Phase C TASK-7 cleanup. The `analyze_structure_image`
+# function and its `structure_analysis_{system,user}.txt` prompts had no
+# live callers in src/ and were deleted. Anchor analysis is now done by
+# `readwater.pipeline.structure.anchor_discovery.run_anchor_discovery`,
+# tested in `tests/test_anchor_discovery.py`.
 
 
 # --- generate_cell_context ---

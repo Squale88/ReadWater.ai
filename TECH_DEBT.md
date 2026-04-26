@@ -19,10 +19,8 @@ Ten files declare `REPO_ROOT = Path("D:/dropbox_root/Dropbox/CascadeProjects/Rea
 
 **Fix:** Replace with `REPO_ROOT = Path(__file__).resolve().parents[1]` (or an env var). One sweep, no behavior change.
 
-### 2. Dead path: `analyze_structure_image()` and `structure_analysis_*` prompts
-[src/readwater/api/claude_vision.py:285](src/readwater/api/claude_vision.py#L285) loads `prompts/structure_analysis_system.txt` and `prompts/structure_analysis_user.txt`. Neither is called by `cell_analyzer.py` — the recursive pipeline now hands z16 cells to `run_structure_phase` in [src/readwater/pipeline/structure/](src/readwater/pipeline/structure/) instead. The function still has unit tests in [tests/test_claude_vision.py](tests/test_claude_vision.py).
-
-**Decide:** delete entirely, or keep as a documented fallback. Either way, drop the tests or retarget them.
+### 2. ~~Dead path: `analyze_structure_image()` and `structure_analysis_*` prompts~~ — RESOLVED (Phase C TASK-7)
+Deleted `analyze_structure_image()` from `src/readwater/api/claude_vision.py`, the prompt pair `prompts/structure_analysis_{system,user}.txt`, and the corresponding tests in `tests/test_claude_vision.py`. Replaced by `readwater.pipeline.structure.anchor_discovery.run_anchor_discovery` (see `docs/PHASE_C_DISCOVERY_PIPELINE.md`).
 
 ### 3. Duplicate grid-drawing logic
 Two independent implementations of "draw a labeled grid on an image":
@@ -31,10 +29,10 @@ Two independent implementations of "draw a labeled grid on an image":
 
 Both reimplement font loading, line drawing, and row/col label math. `grid_overlay` is the more general one; consider having `image_processing` delegate to it (or at least share the label helper).
 
-### 4. Ground-truth evidence only feeds the discovery prompt
-[src/readwater/pipeline/evidence.py](src/readwater/pipeline/evidence.py) builds water/channel/oyster/seagrass coverage tables and injects them into `discover_anchors`. The downstream prompts (`identify_anchor`, `identify_subzones`, `resolve_continuation`) receive no evidence — an oyster-bar identify call doesn't see the oyster-survey mask.
+### 4. ~~Ground-truth evidence only feeds the discovery prompt~~ — partially RESOLVED (Phase C TASK-3 + TASK-7)
+Phase C v1 deleted the legacy `discover_anchors`, `identify_anchor`, `identify_subzones`, and `resolve_continuation` prompts/code paths. The new path in `anchor_discovery.run_anchor_discovery` injects habitat evidence into the v3 prompts via `evidence.build_cell_evidence_section()` (controlled by `AnchorDiscoveryConfig.inject_evidence`). The evidence-into-coord-gen path is intentionally NOT wired (coord-gen is pure spatial localization, not classification).
 
-**Fix:** extend evidence injection into the identify/resolve prompts, scoped to layers relevant to the feature type.
+Phase D substructure work, when it lands, will need its own evidence wiring decisions.
 
 ### 5. Test coverage gaps
 - No end-to-end integration test that exercises `analyze_cell()` recursion → structure phase together (only mocked unit tests + the live `smoke_structure_phase.py`).
@@ -50,5 +48,15 @@ Four tests fail on `master` before any Phase-1 retained-cell-context work:
 
 All four assert specific `state.api_calls` / tree counts after a hard-cap run. They appear to be stale after earlier pipeline refactors that changed what counts as an "API call." Not caused by the retained-cell-context branch — verified by running the same four against `master` independently. Fix is a rewrite of the assertions against the current accounting model, not the production code.
 
+### 7. Phase C TASK-7 leftovers (smaller follow-ups)
+The Phase C cleanup pass kept its scope tight. Items still owed:
+- `scripts/poc_grid_discovery.py`, `scripts/poc_grid_identify.py`, `scripts/smoke_structure_phase.py` — hardcoded Windows paths (item 1) plus references to deleted prompts. Either repath via `Path(__file__).resolve().parents[1]` or archive under `scripts/archive/`.
+- `scripts/prompt_experiment.py` — references `anchor_identification_*_v2.txt` (deleted). Update to reference v3 nogrid/grid pairs or archive.
+- `scripts/continue_depth2.py` and `tests/test_pipeline.py` `_summary.json` reads — confirm whether `continue_depth2.py` outputs are still needed; delete if not.
+- `prompts/grid_scoring_user2.txt` lives on (still loaded by `claude_vision.py:187`). The naming is misleading — should be `grid_scoring_user_no_lean.txt` or similar. Rename in a separate pass.
+- `tests/test_structure_extractors.py` and `tests/test_structure_seed_validator.py` — verify they exercise live code (Phase D extractors should still need them).
+
 ## Done
 <!-- Move items here with commit hash when fixed. -->
+- Phase C TASK-0..TASK-7 (see `docs/PHASE_C_TASKS.md` and `docs/PHASE_C_DISCOVERY_PIPELINE.md`):
+  - GT files for 6 cells, AnchorStructure schema (PhaseEvent/Provenance/Finding/Z18FetchPlan), z18 tile plan helper, v3 prompt grid/nogrid split, coord-gen prompt grid/nogrid split, habitat-evidence injection, anchor_discovery module, agent.py rewrite (1113 → 167 lines), 23 dead prompt files removed, dead `analyze_structure_image()` removed, legacy `prompts.py` LLM wrappers deleted, legacy `tests/test_structure_agent.py` deleted, eval harness with split id/placement reports + per-cell PNG overlays.

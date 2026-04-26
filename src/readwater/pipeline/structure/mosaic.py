@@ -17,13 +17,16 @@ No LLM involvement here. Pure geometry + Pillow.
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 from readwater.api.providers.base import ImageProvider
+from readwater.models.structure import Z18FetchPlan
 from readwater.pipeline.structure.geo import (
+    METERS_PER_DEG_LAT,
     deg_lat_per_pixel,
     deg_lon_per_pixel,
     pixel_to_latlon,
@@ -75,6 +78,85 @@ def z18_tile_span(lat: float) -> tuple[float, float]:
     return (
         TILE_PX * deg_lat_per_pixel(18, lat),
         TILE_PX * deg_lon_per_pixel(18, lat),
+    )
+
+
+def z18_tile_meters(lat: float) -> float:
+    """Ground coverage in meters of one zoom-18 scale=2 1280px tile, at `lat`.
+
+    At Rookery Bay latitudes (~26°N) this is ~343 m per tile, not the ~150 m
+    estimate that appears in `docs/PHASE_C_TASKS.md` TASK-5 (which was based
+    on standard z18 raster tiles, 256 px). The 1280-px Static-Maps tile this
+    codebase actually fetches is roughly twice as wide. Tests below use the
+    real number.
+    """
+    deg_lat, _deg_lon = z18_tile_span(lat)
+    return deg_lat * METERS_PER_DEG_LAT
+
+
+def z18_tile_plan_from_latlon(
+    anchor_center_latlon: tuple[float, float],
+    rough_extent_meters: float,
+    tile_budget: int = 25,
+) -> Z18FetchPlan:
+    """lat/lon-native PLAN_CAPTURE for Phase C v1 (TASK-5).
+
+    Replaces the grid-cell-based path in `select_z18_centers()` for callers
+    that have an anchor lat/lon and a rough extent in meters (TASK-6 wires
+    it into `run_structure_phase`). The grid-cell version is still used by
+    legacy IDENTIFY paths.
+
+    Algorithm:
+      1. Pad `rough_extent_meters` by 25% per the addendum / spec.
+      2. Compute meters-per-tile at this latitude (lat-dependent).
+      3. Pick `n` per axis = ceil(target / tile_meters); bump to odd so the
+         anchor lands on a tile center, not on a tile seam.
+      4. Cap at the largest odd `n` whose `n*n <= tile_budget`.
+      5. Lay out an `n × n` grid in row-major order: rows N→S, cols W→E.
+
+    Returns a `Z18FetchPlan` whose `tile_centers` are (lat, lon) pairs and
+    whose `extent_meters` is the actual covered side length (which may be
+    smaller than `rough_extent_meters * 1.25` when `tile_budget` clamps).
+    """
+    if tile_budget < 1:
+        raise ValueError(f"tile_budget must be >= 1, got {tile_budget}")
+    lat, lon = anchor_center_latlon
+
+    deg_lat_tile, deg_lon_tile = z18_tile_span(lat)
+    tile_m = deg_lat_tile * METERS_PER_DEG_LAT  # meters per tile (N-S)
+
+    # Step 1: padded target extent
+    target = max(rough_extent_meters, 0.0) * 1.25
+
+    # Step 2-3: tiles per axis to cover target, centered on anchor (odd count)
+    n = max(1, math.ceil(target / tile_m)) if tile_m > 0 else 1
+    if n % 2 == 0:
+        n += 1
+
+    # Step 4: clamp to budget. Largest odd a with a*a <= tile_budget.
+    max_axis = int(math.isqrt(tile_budget))
+    if max_axis % 2 == 0:
+        max_axis -= 1
+    if max_axis < 1:
+        max_axis = 1
+    if n > max_axis:
+        n = max_axis
+
+    # Step 5: row-major centers
+    half = (n - 1) / 2.0
+    centers: list[tuple[float, float]] = []
+    for r in range(n):
+        # row 0 is northernmost (highest lat)
+        row_lat = lat + (half - r) * deg_lat_tile
+        for c in range(n):
+            # col 0 is westernmost (lowest lon)
+            col_lon = lon + (c - half) * deg_lon_tile
+            centers.append((row_lat, col_lon))
+
+    return Z18FetchPlan(
+        tile_centers=centers,
+        tile_budget=tile_budget,
+        extent_meters=n * tile_m,
     )
 
 
