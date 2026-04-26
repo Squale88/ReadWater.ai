@@ -22,6 +22,27 @@ z15_same_center is NOT a recursive ancestor. Only z14_parent and z12_grandparent
 
 Treat the context_bundle as GUIDANCE, not truth. If image 1 contradicts an ancestor claim, flag the ancestor observation_id or thread_id as contradicted. But also treat the context_bundle as a REQUIRED INPUT — you must consult the ancestors before committing any classification near a frame edge (see Step 1.5 below).
 
+## Habitat evidence handling
+
+A habitat evidence table may be provided below the context_bundle (NAIP-derived water/land masks, NOAA-charted boating channels, FWC surveyed oyster reefs, FWC surveyed seagrass). Treat it as SUPPORTING EVIDENCE, not ground truth:
+
+- An anchor's `oyster_bar` classification is more credible when the evidence table confirms oyster substrate in that region.
+- A `drain_system` or `creek_mouth_system` is more credible when NOAA shows a charted channel nearby — but a NOAA-charted boating channel is NOT itself a drain; classify the surrounding feature, not the channel polygon.
+- The `water%` layer is high-precision; cells with low water% are land or vegetation and should not host water-feature anchors.
+- `oyster%` and `seagrass%` zero values mean "not in the surveys", NOT "no oysters/seagrass present." Unmapped wild reefs and recently-died-back grass beds exist.
+
+**Use evidence as a tiebreaker for ambiguous bottom types and lobes** (Sweep F):
+- Lighter-toned lobe with `seagrass%` >= 20 in that cell → likely `seagrass_patch` (or `sand_flat` with seagrass overgrowth); confidence 0.6.
+- Lighter-toned lobe with `oyster%` > 0 → likely `oyster_bar`; confidence 0.7.
+- Lighter-toned lobe with `water%` >= 85 and zero oyster/seagrass → likely sand/mud flat (`sand_flat`) or shallow grass not in survey; emit `sand_flat` with `needs_deeper_zoom: true`.
+- Lighter-toned lobe with `water%` < 50 → likely exposed sand/shell shoal (`sand_island`); not a bottom-type ambiguity, treat as a land feature.
+
+**Use evidence to qualify developed-shoreline calls** (Sweep G):
+- `channel%` > 10 in a cell adjacent to developed shoreline → the natural-water-interface test passes; armored points there are valid `developed_water_edge` anchors.
+- `channel%` = 0 AND the cell appears to be interior residential land → developed structures are NOT at a natural-water interface; skip them per Sweep G's negative-example list.
+
+NEVER override image 1: if the image clearly shows a feature the evidence table doesn't confirm (or vice versa), trust the image and note the contradiction in `rationale`. The evidence table is a tiebreaker for ambiguous classifications, not a gate.
+
 ## Expectation on anchor count (read this)
 
 A typical z16 cell in a complex estuary contains **3 to 8 anchors**, not 1 or 2. If you end your first pass with fewer than 3 anchors, it is almost always because you stopped scanning too early. A cell that truly has only 1-2 anchors is rare (pure open bay, pure residential canal system, pure open Gulf). When in doubt, keep looking — there is usually a small island you missed, a drain you mis-read as a point, or a depth-break seam along a shoreline you called "featureless."
@@ -46,6 +67,13 @@ If you see **N distinct small islands** in the same zone, the output contains **
 
 Same rule for drains: if you find multiple distinct drains in different zones, each gets its own anchor.
 
+**Local-complex exception (use sparingly).** A *tight* cluster of 2-4 small features (mini-islets + a sand-island + a flanking point, or a pocket + sand island + mangrove finger) MAY be emitted as one `local_complex` anchor when ALL three of these hold:
+1. The cluster's longest axis is < 0.30 of the cell side.
+2. The features clearly share one flow regime — bay current splits around the *whole* cluster, not around each piece individually.
+3. None of the individual pieces is a Tier 1 feature on its own (a stand-alone fully-visible island sized 50+ m → emit as its own `island` anchor, do NOT bundle).
+
+When in doubt, split. The default is still N anchors for N distinct features. `local_complex` exists to honor cases where the *fishing target* is the cluster as a whole.
+
 ## Position language requirement
 
 Every anchor's `position_in_zone` must start with a compass direction in this closed set: `N | NE | E | SE | S | SW | W | NW | center`, optionally qualified with `-edge`, `-corner`, or `-center-` modifiers (e.g. "NW corner", "center-north", "SW-edge of zone"). Vague phrases like "central", "mid", or "western channel" are NOT acceptable on their own — always anchor the position to a compass direction relative to the cell or zone frame.
@@ -61,6 +89,8 @@ This matters because ancestor cross-checks and downstream consumers rely on comp
 3. **Commit or hedge, don't half-commit.** If you cannot resolve a classification from the imagery at this zoom (typically a bottom-type question), set confidence <= 0.5 and needs_deeper_zoom: true, and list candidate types in deeper_zoom_question. Do not attach a confident label to a feature whose essential character you cannot verify.
 
 4. **Enumerate before you commit.** When you find your first anchor in a zone, do NOT stop. Keep scanning that zone for additional anchors before moving on. Zones of a complex estuary commonly contain 1-3 anchors each.
+
+5. **Frame-clipped features are still anchors.** When a fishable feature is partially cut off by an image edge (only one side visible, or the feature continues off-frame into ancestor context), still emit it. Use the visible portion's centroid for `position_in_zone`, populate `continues_off_edge` with the affected edge(s), and cap `confidence` at 0.7. **Never extrapolate the anchor center beyond the visible image** — coord-gen downstream needs an in-frame center. A clipped feature is more diagnostic than a missed one.
 
 ## Scale rules
 
@@ -80,6 +110,11 @@ Per-type size gates (longest axis as fraction of cell side):
   mangrove_peninsula:               typical 0.08-0.20, hard max 0.25
   island_edge:                      typical 0.10-0.25, hard max 0.30
   current_split / trough:           typical 0.10-0.40, hard max 0.50
+  sand_island (exposed shoal):      typical 0.04-0.20, hard max 0.25
+  sand_flat (lip + shelf):          typical 0.10-0.35, hard max 0.45
+  developed_water_edge:             typical 0.05-0.25, hard max 0.30
+  groin_or_jetty:                   typical 0.04-0.15, hard max 0.20
+  local_complex (cluster bbox):     typical 0.10-0.30, hard max 0.30
 
 Note: `trough` can legitimately run the full length of a shoreline — it is a LINEAR feature, so its longest axis may be large even though its width is small. Do not reject a shoreline-parallel trough for being long; reject only if it is neither linear nor a depth break.
 
@@ -103,9 +138,14 @@ Tier 1 — whole-feature anchors. Prefer these whenever they fit the size gate.
 - pass — a water connection between two larger bodies
 - creek_mouth_system — a creek's mouth + at least its first bend
 - oyster_bar — a contiguous oyster reef / exposed bar
+- sand_island — an exposed sand or shell shoal forming a discrete island in open bay water (the sandy analog of `island`)
 
-Tier 2 — partial / edge anchors.
+Tier 2 — partial / edge anchors and developed-water-edge anchors.
 - cove / pocket, mangrove_peninsula, island_edge, shoreline_bend
+- sand_flat — a shallow sand/mud flat with a clear depth-break lip on the open-water side (the "lip" is the fishable seam, not the flat interior)
+- developed_water_edge — armored shoreline (seawalls, dock clusters) at the interface between developed land and natural moving water
+- groin_or_jetty — beach groin or pass jetty extending into a natural pass / open bay
+- local_complex — see "Local-complex exception" above
 
 Tier 3 — tip / seam anchors. Use only when the larger structure they belong to is a zone.
 - point, shoreline_cut, current_split, trough
@@ -123,6 +163,12 @@ Worked examples:
 
 - South-projecting mangrove nose with a visible narrow channel running into the mangroves behind it.
   This is a drain_system (Tier 1), not a point. The nose is a sub-feature — the drain's west jaw (drain_throat). Trace the water before labeling.
+
+- A shoreline indentation framed by a mangrove shoulder and an opposing point, with a visible color break or current seam at the mouth.
+  This is a confident `cove` (Tier 2), not a Tier 3 zone-interior fragment. Pocket-mouth complexes with framing structure + visible flow exchange are full Tier 2 anchors — emit them, don't demote.
+
+- A bright sand or shell island (oval, isolated, surrounded by deeper water) sitting in an open bay.
+  This is `sand_island` (Tier 1), the sandy analog of `island`. Apply the island vs peninsula test the same way: only Tier 1 if fully water-surrounded inside the frame.
 
 Rule: Before labeling Tier 2 or Tier 3, ask: "Is there a Tier 1 feature nearby that contains this, fits the size gate, and is fully visible (or adequately constrained by ancestor context)?" If yes, label Tier 1 and demote the smaller feature to sub_features.
 
@@ -156,6 +202,8 @@ Ten Thousand Islands geometry commonly hides narrow drain throats between mangro
 
 Do not commit to the first cut you see. Enumerate all drain candidates in your reasoning (with their compass position and the water body behind each), then promote the best-supported ones to final anchors. If multiple drain candidates all pass the drain detection rule, include multiple drain anchors — drain systems in different locations are different anchors.
 
+**Forked / Y-shape drains (single anchor, not multiple).** When a drain mouth shows a Y-fork or branched topology (two or more narrow channels merging into one mouth that opens into the larger body), emit ONE `creek_mouth_system` anchor centered on the merged mouth. The branching is internal structure of one mouth complex — record the fork tips as `sub_features` (`creek_mouth_throat` for each arm). Do NOT split into two separate drain anchors at the fork tips; the fish are at the merged mouth, not the upstream forks.
+
 **Sweep C — Depth-break / trough sweep.** For every shoreline run (not just ones with obvious points), inspect a narrow band along the shoreline for a **linear darker tone** running parallel to the shore. A persistent tone-change band along a shoreline indicates a depth break / trough and is a Tier 3 anchor. Rookery Bay mangrove shorelines very commonly have such shore-parallel troughs — if you see any shoreline with a clearly darker linear band hugging it, that is a trough and MUST appear in the final anchors list.
 
 A trough's `position_in_zone` must name the shoreline it runs along using a compass direction: "along the E shoreline of zoneX", "N-shore trough of zoneY", etc. Never describe a trough without naming the shoreline.
@@ -169,6 +217,36 @@ A trough's `position_in_zone` must name the shoreline it runs along using a comp
 **Sweep E — Confluence sweep.** For every point where 2+ channels visibly converge, check for a small island, oyster bar, or scour feature sitting in the middle of the convergence. **If you find a discrete land mass at the confluence, it is a Tier 1 `island` anchor — not a `current_split`.** `current_split` is reserved for purely open-water split features where no island is present.
 
 **Sweep F — Ambiguous-bottom sweep.** For every lighter-toned lobe or patch in open water (sand / shell / seagrass colors), note it. If bottom type is ambiguous at this zoom, include it with confidence <= 0.5, needs_deeper_zoom: true, and candidate types in deeper_zoom_question. These are not full anchors until resolved but must not be silently dropped.
+
+**Sweep G — Developed AND beach structure sweep (TWO-PASS, CONDITIONAL — natural-water interface only).** Many SW Florida cells include both (1) developed shoreline (residential canals, docks, seawalls, dock clusters at canal mouths) and (2) beach geometry (rock groins, pass jetties, sand spits, pass throats, sand flats fronting beaches). **Run BOTH passes** — these often coexist in the same cell (a residential bayside paired with a Gulf-side beach pass), and missing the beach pass while finding the residential side is a common failure mode.
+
+  **Pass G1 — Developed-shoreline pass.** Look at the residential / built-up portions of the cell. Find dock clusters, seawall corners, dredged canal mouths.
+  **Pass G2 — Beach / pass-side pass.** Look at any sandy or beach-fronted edges of the cell, especially toward the bottom or sides where the cell may include barrier-island or pass geometry. Find: rock groins, pass jetties, sand spits forming throats, sand-flat lips on the open-water side, beach cuts. **Beach features almost always sit at the cell's outer frame edges** (bottom edge for Gulf-side, side edges for pass approaches) — explicitly scan the four frame edges for sandy / brightly-toned shoreline before concluding "no beach features."
+
+These are valid anchors **only when they sit at the interface with natural moving water** — a tidal channel, charted boating channel, pass, bay opening, or the mouth of a natural creek. **Skip purely interior residential structure** (docks lining a private canal, seawalls inside a residential pond, marina slips) — those have no natural-flow exchange and are not fishable anchors at this scale.
+
+The interface test: a man-made feature qualifies only when (a) one face touches natural water that is part of the broader tidal system (visible in z14/z12 as connected to bay/Gulf), AND (b) there is a visible flow signal at that interface (color break, current seam, channel intersection, depth-edge break). If neither is true, the structure is residential interior — do not emit.
+
+Anchor types when the interface test passes:
+  - `developed_water_edge` (Tier 2) — armored point or dock cluster at a bay/channel corner where current visibly wraps
+  - `groin_or_jetty` (Tier 2) — beach groin or pass jetty extending into a charted pass / open bay
+  - `creek_mouth_system` (Tier 1) — outflow of a residential canal system into a natural bay (treat as a drain)
+  - `sand_island` / `sand_flat` (Tier 1/2) — bright exposed shoals near passes or open-bay edges
+  - `pass` (Tier 1) — full sandy pass throat between two land masses
+
+Negative examples (do NOT emit):
+  - A row of docks along an interior residential canal with no visible connection to a bay or charted channel.
+  - A seawall enclosing a private boat basin or marina pond.
+  - Dock pilings inside a fully-enclosed harbor with no current signal.
+
+Positive examples (emit):
+  - Beach groin extending from a sandy shoreline into a NOAA-charted pass — `groin_or_jetty`.
+  - Dock cluster at the corner where a residential canal opens into a tidal bay — `developed_water_edge` (or `creek_mouth_system` if the canal mouth itself is the headline feature).
+  - Bright sand spit forming a throat with the opposite shore at the entrance to a bay — `sand_island` + adjacent `pass` or `developed_water_edge` depending on what's on the opposing shore.
+
+Use the existing `structure_type` vocabulary plus the developed-water-edge types added above. Set `man_made: true` in `rationale` or `sub_features` when applicable. The natural-water-interface test is the gate — when in doubt, skip.
+
+**Quadrant coverage check (required, runs after all sweeps).** Mentally divide the cell into 4 quadrants (NW, NE, SW, SE) and confirm at least one anchor or one explicit "empty quadrant" justification per quadrant. If any quadrant has zero anchors AND is not clearly featureless open water, rerun Sweeps A-G for that quadrant before producing output. The most common failure mode is finding 4 anchors in one half of the cell and ignoring the other half because the easy-to-see structure was on one side.
 
 You do not need to output the raw sweep lists — use them as an internal checklist. However, the `sweep_notes` counters in your output JSON must match what you actually found, and the final `anchors` list must preserve every sweep finding that passes size + relevance gates.
 
@@ -226,13 +304,14 @@ For each anchor, walk through:
 4. Drain detection — if this is a point, is there water behind it? If yes, promote to drain_system.
 5. Fragmentation — am I splitting one real feature into multiple anchors? If yes, merge.
 6. Ambiguous-bottom — does my classification depend on bottom type I can't resolve? If yes, drop confidence <= 0.5 and set needs_deeper_zoom: true with candidate types listed.
-7. **Count check** — is my total anchor count less than 3? If yes, rerun Sweeps A-E. Cells in complex estuaries rarely have fewer than 3 anchors.
+7. **Count check** — is my total anchor count less than 3? If yes, rerun Sweeps A-G. Cells in complex estuaries rarely have fewer than 3 anchors.
 8. **Sweep preservation check** — for each sweep_notes counter greater than 0, does the final anchors list contain at least that many entries of the appropriate type (islands for Sweep A, drains for Sweep B, troughs for Sweep C, etc.)? If fewer, a sweep candidate was silently dropped — recover it.
 9. **Confluence island check** — for every confluence you noted in Sweep E, does a `current_split` anchor occupy that confluence in your output? If yes, is there in fact a discrete island at that confluence? If yes, replace the `current_split` with a Tier 1 `island` anchor.
+10. **Quadrant coverage check** — examine the cell as 4 quadrants (NW, NE, SW, SE) using its visual halves. For every quadrant that has zero anchors, either (a) include a one-sentence note in `cell_summary` justifying why it is empty (e.g. "SW quadrant is open Gulf with no organizing structure"), or (b) rerun Sweeps A-G focused on that quadrant. Do NOT silently leave a quadrant uncovered just because the easy structure is on one side of the cell. Specifically watch for: man-made / beach features in SW Florida residential cells, and structures along the cell side opposite the most prominent feature.
 
 ## Vocabulary
 
-- structure_type: island | drain_system | pass | creek_mouth_system | oyster_bar | cove | mangrove_peninsula | island_edge | shoreline_bend | point | shoreline_cut | current_split | trough
+- structure_type: island | drain_system | pass | creek_mouth_system | oyster_bar | cove | mangrove_peninsula | island_edge | shoreline_bend | point | shoreline_cut | current_split | trough | sand_island | sand_flat | developed_water_edge | groin_or_jetty | local_complex
 - scale: major | minor
 - tier: 1 | 2 | 3
 - status_of_ancestor_ref: supports | contradicts | refines | unrelated
@@ -267,7 +346,9 @@ Reason freely. Then produce a single fenced json block at the end in this exact 
     "troughs_found": 0,
     "peninsula_tips_found": 0,
     "confluence_features_found": 0,
-    "ambiguous_bottom_lobes_found": 0
+    "ambiguous_bottom_lobes_found": 0,
+    "man_made_or_beach_found": 0,
+    "quadrants_with_anchors": ["NW", "NE", "SW", "SE"]
   },
   "anchors": [
     {

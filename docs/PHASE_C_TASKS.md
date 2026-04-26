@@ -329,6 +329,43 @@ Effort legend: **S** = under 2 hrs, **M** = half day, **L** = multi-day.
 
 ---
 
+## Addendum — locked policies (post-design review)
+
+These decisions resolve open questions surfaced during review of the cards above. **Where they conflict with task text, the addendum wins.**
+
+### TASK-2 — anchor matching is strict
+
+- Match coord-gen output to v3 input by `anchor_id` only. The "otherwise by structure_type + position overlap" fallback in TASK-2 step 4 is removed.
+- When coord-gen returns an `anchor_id` not in the v3 input list (or fails to return one for an input anchor), the harness logs a warning and increments an `unmatched_anchors` counter in the report. No fuzzy attribution — fuzzy matching would hide the prompt-quality regressions the harness is meant to surface.
+
+### TASK-2 / TASK-6 — coord-gen failure policy
+
+- **Per-anchor failures (out-of-bounds pixel, `placement_confidence` near zero):** keep the anchor, set `seed_z18_fetch_plan=None`, attach a `Finding` (severity=`warn`) describing the failure. PLAN_CAPTURE in TASK-6 skips anchors without coords. Phase E surfaces the findings to the user.
+- **Whole-batch JSON malformed / unparseable:** fail the COORDS stage (no recovery possible).
+- No `raise` paths for individual bad placements — aligns with v1's "pure findings, state machine carries the truth" stance.
+
+### TASK-4 — provenance backfill, not regenerate
+
+- New `AnchorStructure` instances carry real `Provenance`.
+- Existing cached anchor JSON (tuning runs, fixtures) gets a one-shot migration that backfills `Provenance` with `prompt_version="legacy_pre_v1"`, `prompt_id="unknown"`, empty `provider_config`. Honest about being legacy; future queries can filter on `prompt_version` prefix when provenance accuracy matters.
+
+### TASK-0 — GT entries carry a `status` field
+
+Add `status: Literal["active", "under_review", "excluded"]` to each GT anchor. Match-scoring includes only `status="active"`. Initial assignment for `root-10-8`:
+
+| gt_id | Label                                         | Status         | Notes                                                                                                                                  |
+| ----- | --------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| gt1   | NW drain system                               | active         |                                                                                                                                        |
+| gt2   | Small mangrove island (W lagoon, upper)       | active         |                                                                                                                                        |
+| gt3   | Elongated mangrove islet (W lagoon, lower)    | active         |                                                                                                                                        |
+| gt4   | SE hammock island                             | active         |                                                                                                                                        |
+| gt5   | Peninsula point (N tip of southern peninsula) | under_review   | Classification debatable; user research pending. Kept in file for traceability, excluded from scoring until resolved.                  |
+| gt6   | E-shore trough                                | active         | Tier 3 trough; counts for matching.                                                                                                    |
+| gt7   | Seagrass / sand / flat lobe (ambiguous)       | active         | `structure_type_options: ["seagrass_patch", "sand_lobe", "shallow_flat"]`. v3 is expected to surface this with `needs_deeper_zoom: true`; any of the three types is a hit. |
+| gt8   | Central junction island                       | active         |                                                                                                                                        |
+
+---
+
 ## Out-of-scope reminders
 
 - **Phase D substructure work** (IDENTIFY / VALIDATE_CELLS / EXTRACT on z18 mosaics) is not in this card set. That path stays as-is.

@@ -768,25 +768,9 @@ def test_load_bundle_roundtrips_persisted_bundle(tmp_path):
     assert restored == bundle
 
 
-def test_structure_agent_is_byte_identical_to_master():
-    """Phase-1 hard rule: no edits at all to structure/agent.py.
-
-    Compares the local file to the master branch via git. This is a
-    regression guard — if someone makes any change to agent.py in this
-    branch, the test fails.
-    """
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        ["git", "diff", "master", "--", "src/readwater/pipeline/structure/agent.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, f"git diff failed: {result.stderr}"
-    assert result.stdout == "", (
-        "structure/agent.py has diverged from master in this branch, "
-        "which is forbidden in Phase 1:\n" + result.stdout
-    )
+# Phase 1's "no edits to structure/agent.py" guard was removed when Phase C
+# v1 (docs/PHASE_C_TASKS.md TASK-4 / TASK-6) began intentionally modifying
+# the agent — TASK-4 populates new Provenance / PhaseEvent fields on every
+# AnchorStructure construction, and TASK-6 replaces the DISCOVER stage
+# entirely. Re-introducing a byte-equality guard would now block normal
+# Phase C work.
