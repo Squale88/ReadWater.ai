@@ -282,61 +282,10 @@ async def confirm_fishing_water(
     return parsed
 
 
-async def analyze_structure_image(
-    image_path: str,
-    parent_context: str,
-    center: tuple[float, float],
-    coverage_miles: float,
-) -> dict:
-    """Send a raw satellite image to Claude for detailed structure analysis.
-
-    Uses chain-of-thought. Returns the parsed JSON plus raw_response.
-    """
-    client = _get_client()
-
-    with open(image_path, "rb") as f:
-        image_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    system_prompt = _load_prompt("structure_analysis_system.txt")
-
-    context_line = ""
-    if parent_context:
-        context_line = f"\nContext from parent analysis:\n{parent_context}\n"
-
-    user_template = _load_prompt("structure_analysis_user.txt")
-    user_prompt = user_template.format(
-        parent_context=context_line,
-        center_lat=f"{center[0]:.4f}",
-        center_lon=f"{center[1]:.4f}",
-        coverage_miles=f"{coverage_miles:.2f}",
-    )
-
-    response = await client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": image_b64,
-                        },
-                    },
-                    {"type": "text", "text": user_prompt},
-                ],
-            }
-        ],
-    )
-
-    raw_text = response.content[0].text
-    parsed = _extract_json_from_response(raw_text)
-    parsed["raw_response"] = raw_text
-    return parsed
+# `analyze_structure_image` was deleted by Phase C TASK-7 cleanup. It used
+# the legacy `structure_analysis_{system,user}.txt` prompts (also deleted)
+# and had no callers anywhere in src/. Anchor discovery now goes through
+# `readwater.pipeline.structure.anchor_discovery.run_anchor_discovery`.
 
 
 async def generate_cell_context(
