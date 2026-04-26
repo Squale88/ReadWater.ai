@@ -1,0 +1,15 @@
+Cell: {cell_id}
+Z16 center latlon: ({z16_center_lat}, {z16_center_lon})
+Image size: 1280 × 1280 px (no grid overlay)
+
+## Anchors to localize
+
+Place each anchor below on IMAGE 1 (the clean z16 image). Emit exactly one output entry per input anchor, preserving `anchor_id` exactly. See the system prompt for the bbox + center rules and the compass-quadrant pixel-range guides.
+
+```json
+{anchor_list_json}
+```
+
+## Return
+
+Produce the JSON described in the system prompt, prefixed by any free-form reasoning you need. The caller parses the last fenced json block in your response.
