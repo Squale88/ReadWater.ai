@@ -16,11 +16,25 @@ Zone objects reference the kind of geometry appropriate to them:
 LocalComplex is NOT a single union polygon. It is a collection of member
 features, each with its own ObservedGeometry, plus an optional interpreted
 envelope.
+
+Phase C v1 additions (PhaseEvent, Provenance, Finding, Z18FetchPlan, plus the
+state/phase_history/provenance/findings/seed_z18_fetch_plan/priority_rank/
+zone_id fields on AnchorStructure) bring AnchorStructure up to the contract
+in docs/PIPELINE_PHASES.md. See docs/PHASE_C_TASKS.md TASK-4 for the spec
+and the addendum for the "backfill marker, not regenerate" migration policy
+on legacy cached anchor JSON.
 """
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# --- Literal aliases for state machines ---
+
+StructureState = Literal["draft", "validated", "approved", "rejected"]
+FindingSeverity = Literal["info", "warn", "error"]
 
 
 # --- Geometry classes ---
@@ -89,11 +103,110 @@ class InterpretedGeometry(BaseModel):
     rationale: str = Field(default="", description="Optional LLM rationale for the shape")
 
 
+# --- Phase C v1 envelope objects ---
+
+
+class PhaseEvent(BaseModel):
+    """One transition in an object's phase history.
+
+    Append-only audit log. Every state change in the structure-phase pipeline
+    (DISCOVER -> COORDS -> PLAN_CAPTURE -> ... ) records one PhaseEvent.
+    """
+
+    phase: str = Field(description="e.g. 'C.DISCOVER', 'C.COORDS', 'C.PLAN_CAPTURE'")
+    action: str = Field(description="e.g. 'emit', 'update', 'reject', 'approve'")
+    actor: str = Field(description="Subsystem or human that triggered the event")
+    timestamp: str = Field(description="ISO-8601 UTC timestamp")
+    note: str | None = Field(default=None, description="Optional human-readable detail")
+
+
+class Provenance(BaseModel):
+    """Where this object came from. Required on every Phase-C output object.
+
+    Migration: legacy cached anchor JSON predates this field. The TASK-4
+    backfill script writes Provenance entries marked
+    `prompt_version="legacy_pre_v1"` and `prompt_id="unknown"` so legacy
+    anchors load cleanly without lying about their origin.
+    """
+
+    source_images: list[str] = Field(
+        default_factory=list,
+        description="Paths/refs of images the LLM call saw",
+    )
+    overlay_refs: list[str] = Field(
+        default_factory=list,
+        description="Paths/refs of any overlays drawn on those images (grid, ROI, etc.)",
+    )
+    prompt_id: str = Field(description="Stable identifier of the prompt pair used")
+    prompt_version: str = Field(
+        description="Version tag of the prompt pair (e.g. 'v3_nogrid', 'v3_grid', "
+        "'legacy_pre_v1' for backfilled migrations)",
+    )
+    provider_config: dict = Field(
+        default_factory=dict,
+        description="Model/provider settings (model name, temperature, max_tokens, ...)",
+    )
+    input_hash: str = Field(
+        default="",
+        description="Hash of the inputs (image bytes + prompt text + bundle JSON), "
+        "used for caching and replay matching",
+    )
+
+
+class Finding(BaseModel):
+    """A non-fatal observation produced by validation, classification, or
+    geometry steps. Findings are how Phase-C objects communicate problems
+    without raising — Phase E surfaces them to the user."""
+
+    issue_code: str = Field(description="Stable, machine-readable code, e.g. 'COORDS_OUT_OF_BOUNDS'")
+    severity: FindingSeverity = Field(description="'info' | 'warn' | 'error'")
+    object_id: str = Field(description="ID of the object the finding refers to")
+    field: str | None = Field(default=None, description="Specific field on the object, when relevant")
+    message: str = Field(description="Human-readable description")
+    recommended_action: str | None = Field(
+        default=None,
+        description="Optional next step (e.g. 'rerun coord-gen', 'human review')",
+    )
+
+
+class Z18FetchPlan(BaseModel):
+    """Tile-fetch plan for the Phase D z18 mosaic build.
+
+    Produced by `mosaic.z18_tile_plan_from_latlon()` (TASK-5) at PLAN_CAPTURE
+    time, then consumed by Phase D when it actually fetches the tiles.
+    """
+
+    tile_centers: list[tuple[float, float]] = Field(
+        default_factory=list,
+        description="(lat, lon) centers in row-major order",
+    )
+    tile_budget: int = Field(
+        default=25,
+        description="Hard cap on tile count for this anchor",
+    )
+    extent_meters: float = Field(
+        default=0.0,
+        description="Effective ground coverage of the planned mosaic, in meters per side",
+    )
+
+
 # --- Zone objects ---
 
 
 class AnchorStructure(BaseModel):
-    """The main visible organizing feature of a fishing picture. Observed."""
+    """The main visible organizing feature of a fishing picture. Observed.
+
+    Phase C v1 fields (state, phase_history, provenance, findings,
+    seed_z18_fetch_plan, priority_rank, zone_id) bring AnchorStructure up to
+    the v1 Phase C contract in docs/PIPELINE_PHASES.md. Per TASK-4 + addendum,
+    `provenance` is required on new instances. Legacy cached anchors get a
+    backfilled `prompt_version="legacy_pre_v1"` Provenance via a one-shot
+    migration script rather than silently defaulting to empty.
+    """
+
+    # Allow Pydantic to accept extra fields when loading older JSON snapshots
+    # so we don't trip on small additions during the v1 stabilisation period.
+    model_config = ConfigDict(extra="allow")
 
     anchor_id: str
     structure_type: str = Field(description="e.g. drain, point, cove, oyster_bar, island_edge")
@@ -104,6 +217,24 @@ class AnchorStructure(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     rationale: str = ""
     source_images_used: list[str] = Field(default_factory=list)
+
+    # --- Phase C v1 additions (TASK-4) ---
+    state: StructureState = Field(default="draft")
+    phase_history: list[PhaseEvent] = Field(default_factory=list)
+    provenance: Provenance
+    findings: list[Finding] = Field(default_factory=list)
+    seed_z18_fetch_plan: Z18FetchPlan | None = Field(
+        default=None,
+        description="Set at PLAN_CAPTURE; None if coord-gen failed for this anchor",
+    )
+    priority_rank: int | None = Field(
+        default=None,
+        description="Position in the cell's anchor priority order (1 = highest)",
+    )
+    zone_id: str | None = Field(
+        default=None,
+        description="ID of the LocalComplex / zone this anchor belongs to (from v3 zones)",
+    )
 
 
 class MemberFeature(BaseModel):
