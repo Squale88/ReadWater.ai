@@ -1,18 +1,30 @@
-"""Fetch NAIP imagery + generate an NDWI water mask for a test cell.
+"""Fetch NAIP imagery into the per-cell cache.
 
 For each requested cell, produces:
-  - <cell>_naip_rgb.png        : NAIP natural-color (USGS ImageServer, 1280x1280)
-  - <cell>_naip_4band.tif      : NAIP 4-band GeoTIFF (Planetary Computer)
-  - <cell>_water_mask.png      : binary NDWI water mask (white = water)
-  - <cell>_water_overlay.png   : NAIP RGB with water pixels tinted blue
+  - <cell>_naip_rgb.png      NAIP natural-color (USGS ImageServer, 1280x1280)
+  - <cell>_naip_4band.tif    NAIP 4-band GeoTIFF (Planetary Computer)
+
+Both files are consumed by downstream pipelines:
+  - the NAIP RGB is the base image for the channel and habitat overlays
+    (scripts/noaa_channel_mask.py, scripts/fwc_habitat_mask.py)
+  - the 4-band TIF is read by the Google + NAIP hybrid water-mask
+    pipeline (scripts/google_water_mask.py), which uses the NIR
+    band-derived NDWI to carve smoothed-over islands out of Google's
+    curated water polygons.
+
+This script does NOT compute a water mask itself. The earlier NAIP-only
+NDWI mask approach was abandoned in favor of the Google-anchored hybrid
+because pixel-level NDWI on built-up shorelines false-positives on dark
+roofs and fresh asphalt. See scripts/google_water_mask.py for the
+production water-mask pipeline.
 
 Usage:
   pip install -e '.[cv]'
-  python scripts/naip_water_mask.py --cell root-10-8
-  python scripts/naip_water_mask.py --cell both
+  python scripts/fetch_naip_tifs.py --cell root-10-8
+  python scripts/fetch_naip_tifs.py --cell all
 
-Requires the cv extras (rasterio + pystac-client + planetary-computer) for
-the water-mask step. The RGB-only fetch works without them.
+The 4-band fetch requires the cv extras (rasterio + pystac-client +
+planetary-computer). The RGB-only step works without them.
 """
 
 from __future__ import annotations
@@ -52,21 +64,13 @@ async def fetch_rgb(cell_id: str, center, zoom) -> str:
     return str(out_path)
 
 
-def fetch_4band_and_mask(cell_id: str, center, zoom) -> dict:
+def fetch_4band(cell_id: str, center, zoom) -> dict:
     try:
         from readwater.api.data_sources.naip_4band import (
             bbox_from_center, fetch_naip_4band,
         )
-        from readwater.pipeline.water_mask import (
-            compute_ndwi,
-            load_4band_tif,
-            save_mask_geotiff,
-            save_mask_overlay_png_georeferenced,
-            save_mask_png,
-            threshold_water,
-        )
     except RuntimeError as e:
-        print(f"[{cell_id}] skipping water mask: {e}")
+        print(f"[{cell_id}] skipping 4-band fetch: {e}")
         return {}
 
     bbox = bbox_from_center(center, zoom, image_size=640)
@@ -77,41 +81,8 @@ def fetch_4band_and_mask(cell_id: str, center, zoom) -> dict:
     print(f"[{cell_id}]   NAIP items merged: {result.item_id}")
     print(f"[{cell_id}]   year {result.acquired_year}, {result.bands} bands, "
           f"{result.height}x{result.width} px")
-
-    print(f"[{cell_id}] computing NDWI...")
-    bands = load_4band_tif(result.path, nir_band_index=result.nir_band_index)
-    ndwi = compute_ndwi(bands.green, bands.nir)
-    mask = threshold_water(ndwi, threshold=0.0, min_run_pixels=2)
-    print(f"[{cell_id}]   water fraction: {mask.mean():.1%}")
-
-    # Save the mask both as a simple PNG and as a georeferenced GeoTIFF.
-    mask_png = OUT_ROOT / f"{cell_id}_water_mask.png"
-    save_mask_png(mask, mask_png)
-    mask_tif = OUT_ROOT / f"{cell_id}_water_mask.tif"
-    save_mask_geotiff(mask, bands.profile, mask_tif)
-    print(f"[{cell_id}]   mask PNG -> {mask_png}")
-    print(f"[{cell_id}]   mask GeoTIFF (CRS-aware) -> {mask_tif}")
-
-    # Overlay: use the georeferenced alignment so the mask sits on the RGB
-    # in the right place even when the 4-band coverage is a subset of the tile.
-    overlay_path = OUT_ROOT / f"{cell_id}_water_overlay.png"
-    rgb_path = OUT_ROOT / f"{cell_id}_naip_rgb.png"
-    if rgb_path.exists():
-        save_mask_overlay_png_georeferenced(
-            rgb_image_path=rgb_path,
-            mask_tif_path=mask_tif,
-            rgb_bbox_4326=bbox,
-            out_path=overlay_path,
-        )
-        print(f"[{cell_id}]   georeferenced overlay -> {overlay_path}")
-
     return {
-        "rgb": str(rgb_path),
         "tif": result.path,
-        "mask_png": str(mask_png),
-        "mask_tif": str(mask_tif),
-        "overlay": str(overlay_path),
-        "water_fraction": float(mask.mean()),
         "acquired_year": result.acquired_year,
     }
 
@@ -122,8 +93,8 @@ async def run_one(cell_id: str) -> dict:
     zoom = spec["zoom"]
     print(f"\n=== {cell_id}  center={center}  zoom={zoom} ===")
     rgb_path = await fetch_rgb(cell_id, center, zoom)
-    mask_info = fetch_4band_and_mask(cell_id, center, zoom)
-    return {"cell_id": cell_id, "rgb": rgb_path, **mask_info}
+    tif_info = fetch_4band(cell_id, center, zoom)
+    return {"cell_id": cell_id, "rgb": rgb_path, **tif_info}
 
 
 async def main() -> None:
