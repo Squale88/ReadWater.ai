@@ -11,6 +11,7 @@ from readwater.api.claude_vision import (
     _extract_json_from_response,
     analyze_grid_image,
     analyze_structure_image,
+    generate_cell_context,
 )
 from readwater.api.providers.placeholder import PlaceholderProvider
 
@@ -190,6 +191,143 @@ async def test_structure_image_includes_context(tmp_path):
     user_content = call_args.kwargs["messages"][0]["content"]
     text_block = next(b for b in user_content if b["type"] == "text")
     assert "Near oyster bar complex" in text_block["text"]
+
+
+# --- generate_cell_context ---
+
+
+def _mock_cell_context_response():
+    return {
+        "observations": [
+            {
+                "label": "mangrove_shoreline",
+                "location_hint": "S edge",
+                "confidence": 0.8,
+            },
+            {
+                "label": "tidal_inlet",
+                "location_hint": "SE corner",
+                "confidence": 0.7,
+            },
+        ],
+        "morphology": [
+            {
+                "kind": "drains_to",
+                "statement": "The SE cut drains toward the main channel.",
+                "references": ["obs:1"],
+                "confidence": 0.6,
+            }
+        ],
+        "feature_threads": [
+            {
+                "feature_type": "drain",
+                "status": "hypothesized",
+                "summary": "Possible drain throat on SE corner.",
+                "supporting_observations_local_idx": [1],
+                "parent_thread_id": None,
+                "needs_zoom": 18,
+                "confidence": 0.55,
+            }
+        ],
+        "open_questions": [
+            {"question": "Does this cut have a defined throat?", "target_zoom": 18}
+        ],
+    }
+
+
+async def test_generate_cell_context_returns_four_lists(tmp_path):
+    src = str(tmp_path / "test.png")
+    await PlaceholderProvider(size=64).fetch(MARCO, 16, src)
+
+    mock_client = _make_mock_client(_mock_cell_context_response())
+    with patch("readwater.api.claude_vision._get_client", return_value=mock_client):
+        result = await generate_cell_context(
+            image_path=src,
+            cell_id="root-6-11",
+            zoom=16,
+            center=MARCO,
+            coverage_miles=0.37,
+            ancestor_chain_block="z12 root: open bay\nz14 root-6: tidal flat",
+            grid_scoring_digest="6 of 16 cells scored 5 (kept)",
+            open_thread_block="(none)",
+        )
+
+    for key in ("observations", "morphology", "feature_threads", "open_questions"):
+        assert key in result, f"missing key: {key}"
+        assert isinstance(result[key], list)
+    assert "raw_response" in result
+    assert len(result["observations"]) == 2
+
+
+async def test_generate_cell_context_injects_placeholders(tmp_path):
+    """User-prompt text must contain the cell_id, zoom, and the ancestor block."""
+    src = str(tmp_path / "test.png")
+    await PlaceholderProvider(size=64).fetch(MARCO, 16, src)
+
+    mock_client = _make_mock_client(_mock_cell_context_response())
+    with patch("readwater.api.claude_vision._get_client", return_value=mock_client):
+        await generate_cell_context(
+            image_path=src,
+            cell_id="root-6-11",
+            zoom=16,
+            center=MARCO,
+            coverage_miles=0.37,
+            ancestor_chain_block="z12 root: open bay with inlet SW",
+            grid_scoring_digest="6 of 16 cells kept",
+            open_thread_block="(none)",
+        )
+
+    call_args = mock_client.messages.create.call_args
+    user_content = call_args.kwargs["messages"][0]["content"]
+    text_block = next(b for b in user_content if b["type"] == "text")
+    prompt_text = text_block["text"]
+    assert "root-6-11" in prompt_text
+    assert "16" in prompt_text  # zoom
+    assert "open bay with inlet SW" in prompt_text
+    assert "6 of 16 cells kept" in prompt_text
+
+
+async def test_generate_cell_context_sends_the_image(tmp_path):
+    src = str(tmp_path / "test.png")
+    await PlaceholderProvider(size=64).fetch(MARCO, 16, src)
+
+    mock_client = _make_mock_client(_mock_cell_context_response())
+    with patch("readwater.api.claude_vision._get_client", return_value=mock_client):
+        await generate_cell_context(
+            image_path=src,
+            cell_id="root",
+            zoom=12,
+            center=MARCO,
+            coverage_miles=13.7,
+        )
+
+    call_args = mock_client.messages.create.call_args
+    user_content = call_args.kwargs["messages"][0]["content"]
+    image_block = next(b for b in user_content if b["type"] == "image")
+    assert image_block["source"]["media_type"] == "image/png"
+    assert len(image_block["source"]["data"]) > 0
+
+
+async def test_generate_cell_context_defaults_empty_blocks_to_none_marker(tmp_path):
+    """Default ancestor/digest/thread blocks should render as '(none)'."""
+    src = str(tmp_path / "test.png")
+    await PlaceholderProvider(size=64).fetch(MARCO, 12, src)
+
+    mock_client = _make_mock_client(_mock_cell_context_response())
+    with patch("readwater.api.claude_vision._get_client", return_value=mock_client):
+        await generate_cell_context(
+            image_path=src,
+            cell_id="root",
+            zoom=12,
+            center=MARCO,
+            coverage_miles=13.7,
+        )
+
+    call_args = mock_client.messages.create.call_args
+    user_content = call_args.kwargs["messages"][0]["content"]
+    text_block = next(b for b in user_content if b["type"] == "text")
+    # All three default blocks render as "(none)" in the prompt.
+    assert text_block["text"].count("(none)") >= 3
 
 
 # --- API key ---

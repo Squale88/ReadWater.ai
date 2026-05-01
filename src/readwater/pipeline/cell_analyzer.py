@@ -23,6 +23,13 @@ from readwater.api.claude_vision import (
 )
 from readwater.api.providers.registry import ImageProviderRegistry
 from readwater.models.cell import BoundingBox, Cell, CellAnalysis, CellScore
+from readwater.models.context import CellContext, LineageRef
+from readwater.pipeline.context_bundle import (
+    assemble_z16_bundle,
+    build_cell_context,
+    bundle_path_for,
+    persist_bundle,
+)
 from readwater.pipeline.image_processing import draw_grid_overlay
 from readwater.pipeline.structure import run_structure_phase
 from readwater.pipeline.structure.agent import StructureBudget
@@ -261,8 +268,27 @@ async def _analyze_recursive(
     max_depth: int,
     state: _RunState,
     bbox: BoundingBox | None = None,
+    ancestor_lineage: list[LineageRef] | None = None,
+    ancestor_contexts: dict[str, CellContext] | None = None,
+    position_in_parent: tuple[int, int] | None = None,
 ) -> list[Cell]:
-    """Internal recursive implementation of cell analysis."""
+    """Internal recursive implementation of cell analysis.
+
+    Step 7 additions (data flow only; no LLM invocation here):
+      - ancestor_lineage: ordered LineageRef list from root toward the parent,
+        excluding self. Children receive the parent's chain extended with
+        the parent's own LineageRef.
+      - ancestor_contexts: cell_id -> CellContext snapshots produced by
+        Step 8's descriptive pass on each retained cell. This step carries
+        the dict through unchanged; population happens in Step 8.
+      - position_in_parent: (row, col) of this cell within the parent's
+        4x4 grid. None for the root.
+    """
+    if ancestor_lineage is None:
+        ancestor_lineage = []
+    if ancestor_contexts is None:
+        ancestor_contexts = {}
+
     size_miles = ground_coverage_miles(zoom, center[0])
     if bbox is None:
         bbox = _make_bbox(center, size_miles)
@@ -313,6 +339,11 @@ async def _analyze_recursive(
     # --- Analyze image ---
     sub_cells_geo = _subdivide_bbox(bbox, SECTIONS)
     sub_cells_map = {(r, c): ctr for r, c, ctr in sub_cells_geo}
+
+    # Step 9: z16 bundle path is only set in the live branch below; keep a
+    # None sentinel here so the metadata block downstream can reference it
+    # unconditionally whether we ran dry or live.
+    z16_bundle_path: str | None = None
 
     if state.dry_run:
         analysis = CellAnalysis(
@@ -391,6 +422,84 @@ async def _analyze_recursive(
                 ],
                 model_used=MODEL,
             )
+
+        # --- Retained-cell context pass (Step 8) ---
+        # Every cell reached by _analyze_recursive is by definition retained
+        # (pruning happens above at the parent). Run the descriptive pass now
+        # so the resulting CellContext is available to this cell's children
+        # and to Step 9's z16 bundle assembly. Failures are non-fatal —
+        # analysis.context just stays None.
+        if state.api_calls < state.max_api_calls:
+            try:
+                await asyncio.sleep(0.5)
+                context_digest = {
+                    "summary": analysis.overall_summary,
+                    "hydrology_notes": analysis.hydrology_notes,
+                    "sub_scores": [
+                        {"score": s.score} for s in analysis.sub_scores
+                    ],
+                }
+                cell_context = await build_cell_context(
+                    cell_id=cell_id,
+                    zoom=zoom,
+                    image_path=first_image,
+                    center=center,
+                    coverage_miles=size_miles,
+                    ancestor_lineage=ancestor_lineage,
+                    ancestor_contexts=ancestor_contexts,
+                    grid_scoring_result=context_digest,
+                    model_used=MODEL,
+                )
+                analysis.context = cell_context
+                state.api_calls += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Cell-context pass failed for %s: %s", cell_id, exc,
+                )
+                analysis.context = None
+        else:
+            logger.warning(
+                "API limit reached (%d), skipping cell-context for %s",
+                state.max_api_calls, cell_id,
+            )
+
+        # --- Z16 context bundle assembly (Step 9) ---
+        # Compile the multi-scale context package BEFORE handing the cell to
+        # the structure phase. The bundle is written to disk at a stable path
+        # under structures/{cell_id}/context_bundle.json. Structure-phase code
+        # is not changed in this phase; the bundle is simply inert on disk
+        # for later consumption.
+        if (
+            is_structure_phase_cell
+            and state.registry is not None
+            and analysis.context is not None
+        ):
+            try:
+                self_lineage_ref = LineageRef(
+                    cell_id=cell_id,
+                    zoom=zoom,
+                    depth=depth,
+                    center=center,
+                    bbox=bbox,
+                    image_path=first_image,
+                    position_in_parent=position_in_parent,
+                )
+                bundle = assemble_z16_bundle(
+                    self_lineage=self_lineage_ref,
+                    self_context=analysis.context,
+                    ancestor_lineage=ancestor_lineage,
+                    ancestor_contexts=ancestor_contexts,
+                    z15_same_center_path=context_image_path,
+                    base_output_dir=state.output_dir,
+                )
+                z16_bundle_path = persist_bundle(
+                    bundle,
+                    bundle_path_for(state.output_dir, cell_id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Z16 bundle assembly failed for %s: %s", cell_id, exc,
+                )
 
         # --- Structure phase at zoom 16 (replaces old zoom-18 terminal) ---
         # After dual-pass grid scoring completes on a zoom-16 cell, fetch its
@@ -476,6 +585,8 @@ async def _analyze_recursive(
             }
             for a in analysis.structures
         ]
+    if z16_bundle_path:
+        meta_entry["context_bundle_path"] = z16_bundle_path
     state.metadata.append(meta_entry)
 
     all_cells = [cell]
@@ -546,6 +657,21 @@ async def _analyze_recursive(
                     logger.warning("Confirmation failed for %s: %s", child_id, e)
                     continue  # Skip on error
 
+            self_lineage = LineageRef(
+                cell_id=cell_id,
+                zoom=zoom,
+                depth=depth,
+                center=center,
+                bbox=bbox,
+                image_path=cell.image_path,
+                position_in_parent=position_in_parent,
+            )
+            # Carry our CellContext (if any) forward to children.
+            child_ancestor_contexts = (
+                {**ancestor_contexts, cell_id: analysis.context}
+                if analysis.context is not None
+                else ancestor_contexts
+            )
             child_cells = await _analyze_recursive(
                 center=sub_score.center,
                 zoom=next_zoom,
@@ -556,6 +682,9 @@ async def _analyze_recursive(
                 max_depth=max_depth,
                 state=state,
                 bbox=child_bbox,
+                ancestor_lineage=ancestor_lineage + [self_lineage],
+                ancestor_contexts=child_ancestor_contexts,
+                position_in_parent=(sub_score.row, sub_score.col),
             )
             if child_cells:
                 cell.children_ids.append(child_id)

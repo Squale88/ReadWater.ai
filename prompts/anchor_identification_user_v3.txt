@@ -1,0 +1,16 @@
+Cell: {cell_id}
+Zoom: {zoom}
+Center: ({center_lat}, {center_lon})
+Coverage: ~{coverage_miles} miles per side
+
+## Context bundle
+
+The JSON below is the Z16ContextBundle produced for this cell. Use it according to the rules in the system prompt — as guidance, not truth, but also as a required input for the ancestor cross-check step.
+
+```json
+{context_bundle_json}
+```
+
+## Return
+
+Produce the JSON described in the system prompt, prefixed by any free-form reasoning you need. The caller parses the last fenced json block in your response.

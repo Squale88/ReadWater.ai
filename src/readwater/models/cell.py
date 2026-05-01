@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from pydantic import BaseModel, Field
 
 from readwater.models.structure import AnchorStructure
+
+if TYPE_CHECKING:
+    from readwater.models.context import CellContext
 
 
 class BoundingBox(BaseModel):
@@ -50,6 +55,12 @@ class CellAnalysis(BaseModel):
     structures: list[AnchorStructure] = Field(
         default_factory=list,
         description="Typed anchor structures produced by the structure-phase agent",
+    )
+    context: CellContext | None = Field(
+        default=None,
+        description="Typed retained-cell context (observations, morphology, threads, "
+        "questions, evidence) produced by the descriptive pass on retained cells. "
+        "See readwater.models.context.CellContext.",
     )
     model_used: str = Field(default="claude-sonnet-4-20250514")
     prompt_tokens: int = Field(default=0)

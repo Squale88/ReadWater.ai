@@ -337,3 +337,73 @@ async def analyze_structure_image(
     parsed = _extract_json_from_response(raw_text)
     parsed["raw_response"] = raw_text
     return parsed
+
+
+async def generate_cell_context(
+    image_path: str,
+    cell_id: str,
+    zoom: int,
+    center: tuple[float, float],
+    coverage_miles: float,
+    ancestor_chain_block: str = "(none)",
+    grid_scoring_digest: str = "(none)",
+    open_thread_block: str = "(none)",
+) -> dict:
+    """Generate a structured CellContext payload for a retained cell.
+
+    Sends the cell's image plus compact digests of its ancestor chain, its
+    own grid-scoring result, and any open ancestor threads to Claude and
+    returns the parsed JSON response.
+
+    The returned dict has:
+      - observations[], morphology[], feature_threads[], open_questions[]
+        (raw LLM output — the caller is expected to assign deterministic
+        IDs and resolve local-idx references in build_cell_context).
+      - raw_response: str — Claude's full reasoning text.
+
+    No disk I/O here; persisting the raw markdown is the caller's job.
+    """
+    client = _get_client()
+
+    with open(image_path, "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    system_prompt = _load_prompt("cell_context_system.txt")
+    user_template = _load_prompt("cell_context_user.txt")
+    user_prompt = user_template.format(
+        cell_id=cell_id,
+        zoom=zoom,
+        center_lat=f"{center[0]:.4f}",
+        center_lon=f"{center[1]:.4f}",
+        coverage_miles=f"{coverage_miles:.2f}",
+        ancestor_chain_block=ancestor_chain_block or "(none)",
+        grid_scoring_digest=grid_scoring_digest or "(none)",
+        open_thread_block=open_thread_block or "(none)",
+    )
+
+    response = await client.messages.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        system=system_prompt,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": user_prompt},
+                ],
+            }
+        ],
+    )
+
+    raw_text = response.content[0].text
+    parsed = _extract_json_from_response(raw_text)
+    parsed["raw_response"] = raw_text
+    return parsed
