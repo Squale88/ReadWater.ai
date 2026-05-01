@@ -2,19 +2,21 @@
 
 For each requested cell, produces:
   - ENC download (cached across runs) covering the area
-  - <cell>_channels.geojson     : extracted FAIRWY + DRGARE + deep DEPARE polygons
+  - <cell>_channels.geojson     : FAIRWY + DRGARE polygons plus a thin
+                                  marker-derived channel-lane indicator
+                                  built by joining midpoints of the
+                                  numbered BCNLAT/BOYLAT lateral markers
   - <cell>_channel_mask.png     : binary channel raster (white = charted channel)
   - <cell>_channel_mask.tif     : georeferenced GeoTIFF version
   - <cell>_channel_overlay.png  : NAIP RGB base with channel polygons tinted red
 
-Chart selection: US5FL13M covers Estero Bay to Marco Island. Naples / Marco
-Island / Rookery Bay all fall inside this chart. For other areas, pass
---chart-id.
+Chart selection: US4FL1JT (Gordon Pass to Gullivan Bay, 1:45,000) covers
+Rookery Bay, Marco Island, and Naples. For other areas, pass --chart-id.
 
 Usage:
   pip install -e '.[cv]'
   python scripts/noaa_channel_mask.py --cell root-10-8
-  python scripts/noaa_channel_mask.py --cell both --chart-id US5FL13M
+  python scripts/noaa_channel_mask.py --cell all --chart-id US4FL1JT
 """
 
 from __future__ import annotations
@@ -87,11 +89,15 @@ def ensure_channels_geojson(enc_file: str, chart_id: str) -> str:
         return str(out_path)
 
     print(f"extracting channels from {enc_file} -> {out_path}")
+    # Default extract_channels behavior: FAIRWY + DRGARE polygons plus
+    # marker-derived channel-lane indicators (BCNLAT/BOYLAT lateral
+    # markers, paired by sequence number, midpoints joined as a thin
+    # 10 m-wide centerline). SEAARE / DEPARE are off by default — see
+    # noaa_enc.extract_channels for opt-in flags.
     result = extract_channels(
         enc_file,
         out_path,
         bbox_4326=AREA_BBOX,
-        include_deep_depare=True,
     )
     print(f"  features: {result.feature_count}  "
           f"counts: {result.counts_by_class}  "
@@ -137,7 +143,7 @@ def run_one(cell_id: str, chart_id: str, channels_geojson: str) -> dict:
         print(f"  overlay (NAIP + channel tint) -> {overlay_path}")
     else:
         print(f"  skipping overlay: {naip_rgb} not found "
-              f"(run scripts/naip_water_mask.py first)")
+              f"(run scripts/fetch_naip_tifs.py first)")
 
     return {
         "cell_id": cell_id,
