@@ -141,7 +141,7 @@ def process_cell(
             out[f"{kind}_overlay"] = str(overlay_path)
         else:
             print(f"  skipping {kind} overlay: {naip_rgb} not found "
-                  f"(run scripts/naip_water_mask.py first)")
+                  f"(run scripts/fetch_naip_tifs.py first)")
 
     return out
 
