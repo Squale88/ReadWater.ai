@@ -198,3 +198,129 @@ def test_polygon_iou_disjoint_is_zero():
     b = [(70, 70), (90, 70), (90, 90), (70, 90)]
     iou = polygon_iou(a, b, (100, 100))
     assert iou == 0.0
+
+
+# ------------------------------------------------------------------
+# z18_tile_plan_from_latlon
+#
+# At Rookery Bay (~26°N) one z18 scale=2 1280-px tile covers ~343 m on a
+# side, so the asserts below are framed in those units. The 25% padding
+# from the spec is exercised via the threshold tests.
+# ------------------------------------------------------------------
+
+
+def test_z18_tile_plan_returns_z18_fetch_plan_type():
+    from readwater.pipeline.structure.mosaic import Z18FetchPlan, z18_tile_plan_from_latlon
+
+    plan = z18_tile_plan_from_latlon((26.011172, -81.753546), 200.0)
+    assert isinstance(plan, Z18FetchPlan)
+
+
+def test_z18_tile_plan_tiny_extent_yields_one_tile():
+    """A 10 m extent fits inside one tile (343 m), so the plan is 1×1."""
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    anchor = (26.011172, -81.753546)
+    plan = z18_tile_plan_from_latlon(anchor, rough_extent_meters=10.0)
+    assert len(plan.tile_centers) == 1
+    # The single tile is centered on the anchor.
+    assert plan.tile_centers[0] == pytest.approx(anchor, abs=1e-9)
+
+
+def test_z18_tile_plan_700m_extent_yields_3x3():
+    """700 m * 1.25 padding = 875 m needs >2 tiles per axis at lat 26
+    (~343 m/tile), bumped to odd → 3 per axis → 9 total."""
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    plan = z18_tile_plan_from_latlon((26.011172, -81.753546), rough_extent_meters=700.0)
+    assert len(plan.tile_centers) == 9
+    # extent_meters covers (3 tiles * ~343 m) ≈ 1029 m, well past 875 m.
+    assert plan.extent_meters > 875.0
+
+
+def test_z18_tile_plan_centered_on_anchor():
+    """For odd `n`, the middle tile of a row-major grid is centered on the
+    anchor latlon. With n=3, the middle tile is index 4 (3*1 + 1 in 0-indexed)."""
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    anchor = (26.011172, -81.753546)
+    plan = z18_tile_plan_from_latlon(anchor, rough_extent_meters=700.0)
+    middle = plan.tile_centers[len(plan.tile_centers) // 2]
+    assert middle == pytest.approx(anchor, abs=1e-9)
+
+
+def test_z18_tile_plan_row_major_north_to_south_west_to_east():
+    """Row 0 must be the northernmost (highest lat); within a row, col 0 is
+    the westernmost (lowest lon)."""
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    plan = z18_tile_plan_from_latlon((26.011172, -81.753546), rough_extent_meters=700.0)
+    # 3x3 → 9 centers, indices 0-8.
+    first_row = plan.tile_centers[0:3]
+    second_row = plan.tile_centers[3:6]
+    third_row = plan.tile_centers[6:9]
+    # All same row -> same lat; lat decreases from row 0 to row 2.
+    assert first_row[0][0] == first_row[1][0] == first_row[2][0]
+    assert first_row[0][0] > second_row[0][0] > third_row[0][0]
+    # Within a row: col 0 lon < col 1 lon < col 2 lon.
+    assert first_row[0][1] < first_row[1][1] < first_row[2][1]
+
+
+def test_z18_tile_plan_honors_tile_budget():
+    """tile_budget=9 caps total tiles at 9 even when extent demands more."""
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    # Crank the extent way past the budget (10 km > 5x5 tiles even at lat 26).
+    plan = z18_tile_plan_from_latlon(
+        (26.011172, -81.753546),
+        rough_extent_meters=10_000.0,
+        tile_budget=9,
+    )
+    assert len(plan.tile_centers) <= 9
+    assert plan.tile_budget == 9
+
+
+def test_z18_tile_plan_budget_clamps_to_largest_odd_square():
+    """tile_budget=24 → max axis is floor(sqrt(24))=4, bumped down to odd 3
+    (so 9 tiles, not 16). tile_budget=25 → axis 5, total 25."""
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    anchor = (26.011172, -81.753546)
+    p24 = z18_tile_plan_from_latlon(anchor, rough_extent_meters=10_000.0, tile_budget=24)
+    p25 = z18_tile_plan_from_latlon(anchor, rough_extent_meters=10_000.0, tile_budget=25)
+    assert len(p24.tile_centers) == 9   # 3*3
+    assert len(p25.tile_centers) == 25  # 5*5
+
+
+def test_z18_tile_plan_zero_extent_still_yields_one_tile():
+    """Defensive: a zero-extent anchor (e.g. coord-gen failure with tiny
+    bbox) still gets a single-tile plan rather than an empty list."""
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    plan = z18_tile_plan_from_latlon((26.011172, -81.753546), rough_extent_meters=0.0)
+    assert len(plan.tile_centers) == 1
+
+
+def test_z18_tile_plan_invalid_budget_raises():
+    from readwater.pipeline.structure.mosaic import z18_tile_plan_from_latlon
+
+    with pytest.raises(ValueError):
+        z18_tile_plan_from_latlon((26.0, -81.7), 100.0, tile_budget=0)
+
+
+def test_z18_tile_plan_first_and_last_centers_within_tolerance():
+    """Acceptance criterion sanity: first center is NW corner, last is SE,
+    both at known offsets from the anchor."""
+    from readwater.pipeline.structure.mosaic import (
+        z18_tile_plan_from_latlon,
+        z18_tile_span,
+    )
+
+    lat, lon = 26.011172, -81.753546
+    plan = z18_tile_plan_from_latlon((lat, lon), rough_extent_meters=700.0)
+    # n = 3, half = 1.0
+    deg_lat_tile, deg_lon_tile = z18_tile_span(lat)
+    expected_nw = (lat + 1.0 * deg_lat_tile, lon - 1.0 * deg_lon_tile)
+    expected_se = (lat - 1.0 * deg_lat_tile, lon + 1.0 * deg_lon_tile)
+    assert plan.tile_centers[0] == pytest.approx(expected_nw, abs=1e-9)
+    assert plan.tile_centers[-1] == pytest.approx(expected_se, abs=1e-9)
