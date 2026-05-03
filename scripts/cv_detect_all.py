@@ -26,17 +26,40 @@ PIPELINE
   primary center).
 
   Phase 3a (habitat): seagrass beds and oyster reefs feed the same dedup +
-  clustering pipeline as a regular candidate stream, with category-driven
-  primary priority:
-    - SEAGRASS_BED_LARGE  (CC area >= 10000 px) — substantial bed; allowed
-      to be primary (priority just below ISLAND_LARGE).
-    - SEAGRASS_BED_MEDIUM ( 1500..10000 px ) — meaningful patch; usually
-      attaches as secondary near a richer anchor.
-    - SEAGRASS_BED_SMALL  (  200.. 1500 px ) — small patch; only primary
-      when nothing else is nearby.
-    - OYSTER_BAR (CC area >= 30 px) — never substantial enough to be
-      primary by itself; primary priority near the floor so it almost
-      always falls into another anchor as secondary or tertiary.
+  clustering pipeline as a regular candidate stream, but with two design
+  rules that protect against habitat dominating structural reality:
+
+    (i) Seagrass primary priority is BELOW every structural category, so
+        a structural feature (island / drain / creek / pocket / point /
+        shoal) always claims primary status when present in a cluster.
+        Seagrass only becomes primary when it has no structural neighbor
+        in range — i.e., a true open seagrass flat with nothing else.
+   (ii) An anchor's union bbox is capped at ANCHOR_FOOTPRINT_CAP_PX on
+        either axis (~3x3 grid cells + 10%). When attaching a candidate
+        as secondary would push the cluster past the cap, the candidate
+        is skipped and remains free to become its own anchor.
+
+  Anchors split into two flavors:
+    - STRUCTURAL anchors (id "a1", "a2", ...): primary is a structural
+      candidate (or an oyster, since oyster never anchors a meaningful
+      cluster on its own).
+    - HABITAT anchors (id "h1", "h2", ...): primary is a seagrass CC
+      that didn't fully merge into any structural cluster. These represent
+      "this is a productive seagrass area" rather than "this is a
+      structure to fish at." Rendered with a teal-bordered bbox.
+
+  Cross-reference: every anchor (structural or habitat) records
+  `within_seagrass_bed_ids` — the IDs of any seagrass CCs whose pixel_bbox
+  contains the anchor's primary center. So a structural creek-mouth anchor
+  surrounded by a giant seagrass flat carries the bed's id even though the
+  bed is its own habitat anchor.
+
+  Tier thresholds:
+    - SEAGRASS_BED_LARGE  (CC area >= 10000 px)
+    - SEAGRASS_BED_MEDIUM ( 1500..10000 px )
+    - SEAGRASS_BED_SMALL  (  200.. 1500 px )
+    - OYSTER_BAR (CC area >= 30 px)
+
   Habitat masks are also rendered as semi-transparent tints on the base
   image so spatial extent is visible alongside the point candidates.
 
@@ -124,6 +147,11 @@ SECONDARY_RADIUS_PX = 75      # other-feature center within this distance of pri
                               # bbox -> secondary of that anchor
 TERTIARY_RADIUS_PX = 200      # primary-center to other-anchor-member-center within this
                               # -> tertiary reference (informational only)
+ANCHOR_FOOTPRINT_CAP_PX = 528 # max width or height of an anchor's union bbox
+                              # (3x3 grid cells = 480 px, + 10% slack ≈ 528 px).
+                              # Attaching a secondary that pushes the cluster past
+                              # this cap is rejected; the candidate stays free to
+                              # become its own anchor.
 
 # Categories grouped by what they describe physically. Only intra-group pairs
 # can be duplicates.
@@ -181,10 +209,6 @@ CATEGORY_PRIORITY = {
 CLUSTER_PRIMARY_PRIORITY = {
     # Tier 1: discrete land bodies — always preferred as primary when in cluster
     "ISLAND_LARGE":         100,
-    # Tier 1.5: substantial seagrass beds — describe a whole productive area
-    # like a small island. Allowed to anchor a cluster but ranked just under
-    # ISLAND_LARGE so that when both are nearby, the discrete landmass wins.
-    "SEAGRASS_BED_LARGE":    95,
     "ISLAND_MEDIUM":         90,
     "ISLAND_SMALL":          80,
     # Tier 2: comprehensive water features
@@ -192,17 +216,20 @@ CLUSTER_PRIMARY_PRIORITY = {
     "CREEK_MOUTH":           65,
     "LARGE_POCKET":          60,
     "SHOAL":                 55,
-    # Tier 2.5: medium seagrass beds — meaningful patches but rarely the
-    # most informative thing in a cluster
-    "SEAGRASS_BED_MEDIUM":   50,
     # Tier 3: detector-specific scale tiers (less comprehensive)
     "POINT_R26":             40,
     "POCKET_R26":            40,
     "POINT_R13":             30,
     "POCKET_R13":            30,
-    # Tier 4: small habitat — almost never primary unless truly isolated
-    "SEAGRASS_BED_SMALL":    25,
-    "OYSTER_BAR":            15,
+    # Tier 4: habitat — habitat is a cover class, not a structural feature.
+    # Structural anchors always win primary status when present in a cluster.
+    # A seagrass bed only becomes primary when nothing structural is in
+    # range — that's the definition of "open seagrass flat with no structure"
+    # and is exactly the case where it deserves to anchor on its own.
+    "SEAGRASS_BED_LARGE":    20,
+    "SEAGRASS_BED_MEDIUM":   18,
+    "SEAGRASS_BED_SMALL":    15,
+    "OYSTER_BAR":            10,
 }
 
 
@@ -481,9 +508,20 @@ def _union_bbox(bboxes: list[list[int]]) -> list[int]:
     ]
 
 
+def _bbox_within_cap(bbox: list[int], cap: int) -> bool:
+    """True if both width and height of bbox fit inside the cap."""
+    return (bbox[2] - bbox[0]) <= cap and (bbox[3] - bbox[1]) <= cap
+
+
+def _category_is_habitat(category: str) -> bool:
+    return category in GROUP_SEAGRASS or category in GROUP_OYSTER
+
+
 def cluster_into_anchors(kept: list[dict],
                          secondary_radius: int = SECONDARY_RADIUS_PX,
-                         tertiary_radius: int = TERTIARY_RADIUS_PX) -> list[dict]:
+                         tertiary_radius: int = TERTIARY_RADIUS_PX,
+                         footprint_cap: int = ANCHOR_FOOTPRINT_CAP_PX
+                         ) -> list[dict]:
     """Group surviving (post-dedup) candidates into anchor groups.
 
     Each candidate goes into exactly one anchor as either primary or secondary.
@@ -491,14 +529,25 @@ def cluster_into_anchors(kept: list[dict],
     anchors but happen to be within tertiary_radius of this anchor's primary
     center — informational, non-exclusive.
 
+    With CLUSTER_PRIMARY_PRIORITY now demoting habitat below all structural
+    categories, the greedy primary-selection loop naturally produces all
+    structural anchors first, then any unassigned habitat candidates form
+    their own (habitat-flavored) anchors. We mark each anchor with a
+    `type` field ("structural" or "habitat") based on its primary category.
+
+    Footprint cap: when attaching a candidate as secondary would push the
+    anchor's union bbox beyond `footprint_cap` on either axis, the candidate
+    is rejected and remains free to become its own anchor downstream.
+
     Returns a list of anchor dicts, each with:
-      id (a1, a2, ...), primary, secondary (list), tertiary_refs (list of IDs),
-      anchor_bbox (union of primary + secondary bboxes).
+      id (a1, a2, ... for structural; h1, h2, ... for habitat),
+      type ("structural" | "habitat"),
+      primary, secondary (list), tertiary_refs (list of IDs),
+      anchor_bbox (union of primary + secondary bboxes),
+      within_seagrass_bed_ids (filled in by post-processing).
     """
     # Sort: highest CLUSTER_PRIMARY_PRIORITY first; tie-breaker = bbox area
-    # (largest first). This puts ISLAND_* ahead of all water features for
-    # primary selection, matching the user intent that a discrete landmass
-    # encompasses surrounding features.
+    # (largest first).
     sorted_cands = sorted(
         kept,
         key=lambda c: (-CLUSTER_PRIMARY_PRIORITY.get(c["category"], 0),
@@ -507,28 +556,58 @@ def cluster_into_anchors(kept: list[dict],
 
     assigned: set[str] = set()
     anchors: list[dict] = []
+    n_struct = 0
+    n_habitat = 0
 
     for primary in sorted_cands:
         if primary["id"] in assigned:
             continue
-        secondary: list[dict] = []
+
+        is_habitat_primary = _category_is_habitat(primary["category"])
+        primary_bbox = list(primary["pixel_bbox"])
+
+        # Build a list of in-range candidates with their distances to the
+        # primary bbox; sort ascending so the closest fit attempts first.
+        # This matters now that the cap can reject later attachments.
+        in_range: list[tuple[float, dict]] = []
         for other in kept:
             if other["id"] in assigned or other["id"] == primary["id"]:
                 continue
-            d = _distance_point_to_bbox(other["pixel_center"], primary["pixel_bbox"])
+            d = _distance_point_to_bbox(other["pixel_center"], primary_bbox)
             if d <= secondary_radius:
-                secondary.append(other)
-                assigned.add(other["id"])
+                in_range.append((d, other))
+        in_range.sort(key=lambda t: t[0])
+
+        secondary: list[dict] = []
+        running_bbox = list(primary_bbox)
+        for _d, other in in_range:
+            candidate_union = _union_bbox([running_bbox, other["pixel_bbox"]])
+            if not _bbox_within_cap(candidate_union, footprint_cap):
+                # Attaching this would push the anchor over the size cap;
+                # leave it unassigned so it can become its own anchor.
+                continue
+            secondary.append(other)
+            assigned.add(other["id"])
+            running_bbox = candidate_union
+
         assigned.add(primary["id"])
-        anchor_bbox = _union_bbox(
-            [primary["pixel_bbox"]] + [s["pixel_bbox"] for s in secondary]
-        )
+        if is_habitat_primary:
+            n_habitat += 1
+            anchor_id = f"h{n_habitat}"
+            anchor_type = "habitat"
+        else:
+            n_struct += 1
+            anchor_id = f"a{n_struct}"
+            anchor_type = "structural"
+
         anchors.append({
-            "id": f"a{len(anchors) + 1}",
+            "id": anchor_id,
+            "type": anchor_type,
             "primary": primary,
             "secondary": secondary,
-            "anchor_bbox": anchor_bbox,
-            "tertiary_refs": [],   # filled in below
+            "anchor_bbox": running_bbox,
+            "tertiary_refs": [],         # filled in below
+            "within_seagrass_bed_ids": [],   # filled in below
         })
 
     # Tertiary pass: features in OTHER anchors within tertiary_radius of THIS
@@ -542,6 +621,21 @@ def cluster_into_anchors(kept: list[dict],
                 continue
             if _euclidean(primary_center, other["pixel_center"]) <= tertiary_radius:
                 anchor["tertiary_refs"].append(other["id"])
+
+    # Within-seagrass cross-reference pass: for every seagrass CC in `kept`,
+    # find every STRUCTURAL anchor whose primary center sits inside that
+    # seagrass CC's bbox and tag the anchor with the bed id. Habitat anchors
+    # don't get this flag — "seagrass inside seagrass" is meaningless and
+    # just creates noise from overlapping bboxes of disjoint CCs.
+    seagrass_records = [c for c in kept if c["category"] in GROUP_SEAGRASS]
+    for anchor in anchors:
+        if anchor["type"] != "structural":
+            continue
+        pcx, pcy = anchor["primary"]["pixel_center"]
+        for sg in seagrass_records:
+            x0, y0, x1, y1 = sg["pixel_bbox"]
+            if x0 <= pcx <= x1 and y0 <= pcy <= y1:
+                anchor["within_seagrass_bed_ids"].append(sg["id"])
 
     return anchors
 
@@ -624,14 +718,20 @@ def render_combined_overlay(base_image_path: Path,
     label_font = load_font(13)
     primary_label_font = load_font(16)
 
-    # Pass 1: draw each anchor's bounding rectangle (faint gray) so the
-    # cluster footprint is visible.
+    # Pass 1: draw each anchor's bounding rectangle. Structural anchors get
+    # a faint white outline; habitat anchors get a teal outline so they're
+    # visually distinct from "this is a place to fish at" structural anchors.
     for anchor in anchors:
         ax0, ay0, ax1, ay1 = anchor["anchor_bbox"]
         # Pad a few pixels so the box visually contains the dots
         ax0 -= 6; ay0 -= 6; ax1 += 6; ay1 += 6
-        draw.rectangle([ax0, ay0, ax1, ay1],
-                       outline=(220, 220, 220, 140), width=1)
+        if anchor.get("type") == "habitat":
+            outline = (40, 200, 170, 200)   # bright teal
+            width = 2
+        else:
+            outline = (220, 220, 220, 140)  # faint white-grey
+            width = 1
+        draw.rectangle([ax0, ay0, ax1, ay1], outline=outline, width=width)
 
     # Pass 2: draw secondary dots (so primaries render on top of them).
     for anchor in anchors:
@@ -676,11 +776,15 @@ def render_combined_overlay(base_image_path: Path,
     title_font = load_font(15)
 
     n_kept = sum(1 + len(a["secondary"]) for a in anchors)
+    n_struct = sum(1 for a in anchors if a.get("type") == "structural")
+    n_habitat = sum(1 for a in anchors if a.get("type") == "habitat")
     legend_draw.text(
         (10, panel_y0 + 8),
-        f"Phase 3a: dedup + cluster + habitat.  {len(anchors)} anchors, "
+        f"Phase 3a: dedup + cluster + habitat.  "
+        f"{n_struct} structural + {n_habitat} habitat anchors, "
         f"{n_kept} member features, {len(dropped)} dedup-dropped.  "
-        f"Secondary radius {SECONDARY_RADIUS_PX} px, tertiary {TERTIARY_RADIUS_PX} px.",
+        f"Sec radius {SECONDARY_RADIUS_PX} px, tert {TERTIARY_RADIUS_PX} px, "
+        f"footprint cap {ANCHOR_FOOTPRINT_CAP_PX} px.",
         fill=(255, 255, 255, 255), font=title_font,
     )
 
@@ -726,14 +830,20 @@ def render_combined_overlay(base_image_path: Path,
         )
         if not sec_summary:
             sec_summary = "—"
-        if len(sec_summary) > 90:
-            sec_summary = sec_summary[:87] + "..."
+        if len(sec_summary) > 70:
+            sec_summary = sec_summary[:67] + "..."
+        within = anchor.get("within_seagrass_bed_ids") or []
+        within_str = f" inSG=[{','.join(within)}]" if within else ""
         line = (
             f"{anchor['id'].upper():<3s} "
-            f"{primary['id']:>4s} {primary['category']:<13s} @{cell:<3s} "
-            f"sec[{len(anchor['secondary'])}]={sec_summary}  tert={len(anchor['tertiary_refs'])}"
+            f"{primary['id']:>4s} {primary['category']:<14s} @{cell:<3s} "
+            f"sec[{len(anchor['secondary'])}]={sec_summary}  "
+            f"tert={len(anchor['tertiary_refs'])}{within_str}"
         )
-        legend_draw.text((28, y), line, fill=(255, 255, 255, 255), font=legend_font)
+        # Habitat anchors get a teal-tinted line so they stand out in the list.
+        text_color = ((180, 240, 220, 255) if anchor.get("type") == "habitat"
+                      else (255, 255, 255, 255))
+        legend_draw.text((28, y), line, fill=text_color, font=legend_font)
         y += line_h
     if len(anchors) > max_lines:
         legend_draw.text((28, y),
@@ -801,9 +911,13 @@ def run_one(cell_id: str) -> int:
                                     secondary_radius=SECONDARY_RADIUS_PX,
                                     tertiary_radius=TERTIARY_RADIUS_PX)
     n_secondary = sum(len(a["secondary"]) for a in anchors)
+    n_struct = sum(1 for a in anchors if a.get("type") == "structural")
+    n_habitat = sum(1 for a in anchors if a.get("type") == "habitat")
+    n_with_sg = sum(1 for a in anchors if a.get("within_seagrass_bed_ids"))
     print(f"  cluster: {len(anchors)} anchors  "
-          f"(primary={len(anchors)}, secondary={n_secondary}, "
-          f"tertiary refs avg={sum(len(a['tertiary_refs']) for a in anchors) / max(1, len(anchors)):.1f})")
+          f"({n_struct} structural + {n_habitat} habitat, "
+          f"secondary={n_secondary}, "
+          f"{n_with_sg} anchors flagged within_seagrass_bed)")
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     overlay_path = out_dir / f"cv_all_{ts}.png"
@@ -835,18 +949,23 @@ def run_one(cell_id: str) -> int:
         "dedup_distance_px": DEDUP_DISTANCE_PX,
         "secondary_radius_px": SECONDARY_RADIUS_PX,
         "tertiary_radius_px": TERTIARY_RADIUS_PX,
+        "anchor_footprint_cap_px": ANCHOR_FOOTPRINT_CAP_PX,
         "loaded_per_source": per_source_counts,
         "kept_count": len(kept),
         "dropped_count": len(dropped),
         "anchor_count": len(anchors),
+        "structural_anchor_count": sum(1 for a in anchors if a.get("type") == "structural"),
+        "habitat_anchor_count": sum(1 for a in anchors if a.get("type") == "habitat"),
         "habitat_summary": habitat_summary,
         "anchors": [
             {
                 "id": a["id"],
+                "type": a.get("type", "structural"),
                 "anchor_bbox": a["anchor_bbox"],
                 "primary": _light_record(a["primary"]),
                 "secondary": [_light_record(s) for s in a["secondary"]],
                 "tertiary_refs": a["tertiary_refs"],
+                "within_seagrass_bed_ids": a.get("within_seagrass_bed_ids", []),
             }
             for a in anchors
         ],
