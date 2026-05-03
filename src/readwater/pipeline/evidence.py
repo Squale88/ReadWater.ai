@@ -232,3 +232,221 @@ def _pct(frac: float) -> str:
     if pct == 0:  # fractional but rounds to 0
         return "<1%"
     return f"{pct}%"
+
+
+# --- Per-cell convenience entry point used by anchor-discovery / harnesses ---
+
+
+def _default_mask_paths(cell_id: str, area_root: Path) -> dict[str, Path]:
+    """Standard per-cell mask layout under data/areas/<area>_<layer>/.
+
+    Convention from the existing data:
+      data/areas/<area>_google_water/<cell_id>_water_mask.png  (preferred — Google-derived)
+      data/areas/<area>_naip/<cell_id>_water_mask.png          (fallback — NAIP NDWI)
+      data/areas/<area>_channels/<cell_id>_channel_mask.png
+      data/areas/<area>_habitats/<cell_id>_oyster_mask.png
+      data/areas/<area>_habitats/<cell_id>_seagrass_mask.png
+    """
+    base = area_root.parent
+    area_name = area_root.name
+    google_water = base / f"{area_name}_google_water" / f"{cell_id}_water_mask.png"
+    naip_water = base / f"{area_name}_naip" / f"{cell_id}_water_mask.png"
+    return {
+        "water": google_water if google_water.exists() else naip_water,
+        "channel": base / f"{area_name}_channels" / f"{cell_id}_channel_mask.png",
+        "oyster": base / f"{area_name}_habitats" / f"{cell_id}_oyster_mask.png",
+        "seagrass": base / f"{area_name}_habitats" / f"{cell_id}_seagrass_mask.png",
+    }
+
+
+def build_cell_evidence_section(
+    cell_id: str,
+    area_root: Path,
+    grid_rows: int = 8,
+    grid_cols: int = 8,
+    image_size: tuple[int, int] = (1280, 1280),
+    mask_paths: dict[str, Path] | None = None,
+) -> str:
+    """Find this cell's habitat masks on disk and produce a prompt-ready section.
+
+    Returns a placeholder string if no mask files were found, so the caller
+    can always pass the result into a prompt template that has an
+    `{evidence_table}` placeholder.
+
+    Pass `mask_paths` explicitly to override the default layout (useful for
+    tests / non-standard layouts).
+    """
+    if mask_paths is None:
+        candidates = _default_mask_paths(cell_id, area_root)
+    else:
+        candidates = mask_paths
+    found = {layer: str(p) for layer, p in candidates.items() if Path(p).exists()}
+    if not found:
+        return f"(no habitat evidence masks found for {cell_id})"
+    table = build_evidence_table(found, grid_rows=grid_rows,
+                                 grid_cols=grid_cols, image_size=image_size)
+    return format_evidence_for_prompt(table)
+
+
+# --- Habitat composite overlay (image-side evidence, complement to the table) ---
+
+
+# Layer color scheme for the composite. Layers paint in dict-iteration
+# order, so EARLIER layers sit UNDER later ones (water under oyster +
+# seagrass). Per-layer alpha lets large-area layers (water) stay subtle
+# while spot layers (oyster/seagrass) pop. Picked to be distinct from
+# the satellite image's natural greens/blues.
+_COMPOSITE_LAYERS: dict[str, tuple[int, int, int, int]] = {
+    # (R, G, B, alpha)  — water FIRST so oyster + seagrass paint over it
+    "water": (80, 170, 220, 70),     # soft cyan — Google-derived water mask
+    "oyster": (220, 40, 40, 110),    # red — FWC surveyed oyster reefs
+    "seagrass": (60, 220, 60, 110),  # bright lime green — FWC surveyed SAV
+}
+# `channel` intentionally excluded from the composite per the
+# evaluation-pass direction. Can be added back as another entry.
+
+
+def build_habitat_composite_overlay(
+    cell_id: str,
+    z16_image_path: Path,
+    area_root: Path,
+    output_path: Path,
+    mask_paths: dict[str, Path] | None = None,
+    image_size: tuple[int, int] = (1280, 1280),
+    with_grid: bool = False,
+) -> Path | None:
+    """Render z16 base + water (cyan) + oyster (red) + seagrass (lime) overlays
+    as a single composite PNG.
+
+    The composite gives a downstream model SPATIAL information about the habitat
+    data — where water boundaries and FWC survey polygons sit on the image —
+    rather than just per-grid-cell percentages.
+
+    `with_grid=True` draws an 8x8 A1-H8 overlay on top of the habitat layers
+    but under the legend. Style matches `structure/grid_overlay.draw_label_grid`
+    so the rendered image lines up with prompts that reference grid cells.
+
+    Returns the output_path on success, or None if the source z16 is missing
+    or no habitat masks are found (composite would just be the z16, no value).
+
+    Cache validity: the caller is responsible for deciding when to
+    regenerate; this function always re-renders. Cheap (~hundreds of ms).
+    """
+    if not z16_image_path.exists():
+        return None
+    if mask_paths is None:
+        mask_paths = _default_mask_paths(cell_id, area_root)
+
+    available = {
+        layer: Path(p) for layer, p in mask_paths.items()
+        if layer in _COMPOSITE_LAYERS and Path(p).exists()
+    }
+    if not available:
+        return None  # no habitat data — composite would equal the base z16
+
+    base = Image.open(z16_image_path).convert("RGBA")
+    if base.size != image_size:
+        # Refuse silently — caller should ensure dims match.
+        return None
+
+    # Iterate in _COMPOSITE_LAYERS order (water first, then oyster, then
+    # seagrass) so later layers paint over earlier ones — water sits as
+    # a base tint with the FWC layers on top.
+    overlay = Image.new("RGBA", image_size, (0, 0, 0, 0))
+    rendered_layers: list[str] = []
+    for layer, (r, g, b, alpha) in _COMPOSITE_LAYERS.items():
+        if layer not in available:
+            continue
+        mask_path = available[layer]
+        with Image.open(mask_path) as mask_im:
+            mask_arr = np.array(mask_im.convert("L"))
+        if mask_arr.shape != (image_size[1], image_size[0]):
+            with Image.open(mask_path) as mask_im:
+                mask_arr = np.array(
+                    mask_im.convert("L").resize(image_size, Image.NEAREST)
+                )
+        binary = mask_arr > 127
+        if not binary.any():
+            continue  # layer present but empty for this cell
+
+        rgba = np.zeros((image_size[1], image_size[0], 4), dtype=np.uint8)
+        rgba[binary] = (r, g, b, alpha)
+        layer_im = Image.fromarray(rgba, mode="RGBA")
+        overlay = Image.alpha_composite(overlay, layer_im)
+        rendered_layers.append(layer)
+
+    # Optional 8x8 A1-H8 grid drawn on top of habitat layers, under the
+    # legend. Matches the style used by structure/grid_overlay so a paired
+    # grid-mode image stays consistent.
+    from PIL import ImageDraw, ImageFont
+    if with_grid:
+        rows, cols = 8, 8
+        gw, gh = image_size
+        cell_w = gw / cols
+        cell_h = gh / rows
+        gridlayer = Image.new("RGBA", image_size, (0, 0, 0, 0))
+        gd = ImageDraw.Draw(gridlayer, "RGBA")
+        for i in range(1, cols):
+            x = int(i * cell_w)
+            gd.line([(x + 1, 0), (x + 1, gh)], fill=(0, 0, 0, 200), width=1)
+            gd.line([(x, 0), (x, gh)], fill=(255, 255, 255, 230), width=2)
+        for j in range(1, rows):
+            y = int(j * cell_h)
+            gd.line([(0, y + 1), (gw, y + 1)], fill=(0, 0, 0, 200), width=1)
+            gd.line([(0, y), (gw, y)], fill=(255, 255, 255, 230), width=2)
+        try:
+            grid_font = ImageFont.truetype("arial.ttf", max(10, int(min(cell_w, cell_h) * 0.30)))
+        except (OSError, IOError):
+            grid_font = ImageFont.load_default()
+        for r in range(rows):
+            for c in range(cols):
+                label = f"{chr(ord('A') + r)}{c + 1}"
+                cx = int((c + 0.5) * cell_w)
+                cy = int((r + 0.5) * cell_h)
+                bbox_t = grid_font.getbbox(label)
+                tw = bbox_t[2] - bbox_t[0]
+                th = bbox_t[3] - bbox_t[1]
+                tx = cx - tw // 2
+                ty = cy - th // 2
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx or dy:
+                            gd.text((tx + dx, ty + dy), label, fill="black", font=grid_font)
+                gd.text((tx, ty), label, fill="white", font=grid_font)
+        overlay = Image.alpha_composite(overlay, gridlayer)
+
+    # Legend in bottom-right corner so a viewer (model or human) knows what
+    # each color is.
+    draw = ImageDraw.Draw(overlay)
+    try:
+        font = ImageFont.truetype("arial.ttf", 18)
+    except (OSError, IOError):
+        font = ImageFont.load_default()
+    if rendered_layers:
+        line_h = 24
+        box_w = 240
+        box_h = line_h * len(rendered_layers) + 16
+        box_x0 = image_size[0] - box_w - 8
+        box_y0 = image_size[1] - box_h - 8
+        draw.rectangle(
+            [box_x0, box_y0, box_x0 + box_w, box_y0 + box_h],
+            fill=(0, 0, 0, 200), outline=(255, 255, 255, 255), width=2,
+        )
+        ty = box_y0 + 8
+        layer_label = {
+            "water": "Water (Google)",
+            "oyster": "Oyster (FWC)",
+            "seagrass": "Seagrass (FWC)",
+        }
+        for layer in rendered_layers:
+            r, g, b, _ = _COMPOSITE_LAYERS[layer]
+            sx = box_x0 + 8
+            draw.rectangle([sx, ty + 2, sx + 16, ty + 18], fill=(r, g, b, 255))
+            label = layer_label.get(layer, layer)
+            draw.text((sx + 24, ty), label, fill=(255, 255, 255, 255), font=font)
+            ty += line_h
+
+    composed = Image.alpha_composite(base, overlay)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    composed.convert("RGB").save(output_path)
+    return output_path
