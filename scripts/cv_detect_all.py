@@ -1,5 +1,5 @@
 """CV-feature orchestrator (Phase 1: dedup + Phase 2: anchor clustering +
-Phase 3a: habitat).
+Phase 3a: habitat + Phase 3b: anchor-of-anchors parent/child links).
 
 Reads the latest JSON output from each per-feature detector for a cell:
   cv_detect_drains.py   ->  cv_drains_<ts>.json   (DRAIN / CREEK_MOUTH / LARGE_POCKET / SHOAL)
@@ -62,6 +62,28 @@ PIPELINE
 
   Habitat masks are also rendered as semi-transparent tints on the base
   image so spatial extent is visible alongside the point candidates.
+
+  Phase 3b (anchor-of-anchors): a "low value" anchor sitting close to a
+  "high value" anchor is recorded as the high-value anchor's CHILD via
+  cross-reference (no merge — both anchors stay first-class so the
+  footprint cap is preserved).
+
+  Low value = (1 primary + 0 secondary) OR (1 primary + 1 secondary
+              where the secondary is a "small tier" feature: POINT_R13,
+              POINT_R26, POCKET_R13, POCKET_R26, OYSTER_BAR,
+              SEAGRASS_BED_SMALL).
+  High value = anything not low value.
+  Close = EITHER
+            (a) primary-to-primary center distance <= PARENT_CENTER_DISTANCE_PX
+                AND anchor-bbox edge-to-edge distance <= PARENT_EDGE_DISTANCE_PX
+            (b) low-value primary center is inside (or within
+                PARENT_NEARLY_IN_PX of) the high-value anchor's bbox
+                (override rule for cases where the rich anchor's bbox is
+                large and the centers are far apart but the lone anchor
+                sits geographically inside the rich anchor's footprint).
+  Greedy single-pass: each low-value anchor picks its single closest
+  qualifying parent (no chains, no re-parenting).
+  Habitat anchors may be either parent or child.
 
 DEDUP MODEL (Phase 1)
 
@@ -152,6 +174,33 @@ ANCHOR_FOOTPRINT_CAP_PX = 528 # max width or height of an anchor's union bbox
                               # Attaching a secondary that pushes the cluster past
                               # this cap is rejected; the candidate stays free to
                               # become its own anchor.
+
+# ---- Phase 3b parent/child parameters ----
+# At z16 over Rookery Bay (~26°N), 1 px ≈ 2.15 m. The initial spec was
+# center<=150m / edge<=25m (== 70px / 12px) but on real cells that fired
+# zero links because almost no candidate-pair sits with both centers <70px
+# AND bboxes touching to within 12px. Loosened by ~3x after viewing actual
+# nearest-neighbor distances on root-10-8 + root-11-5.
+PARENT_CENTER_DISTANCE_PX = 200  # ≈ 430 m: low-value primary must be within this
+                                 # of a high-value primary to qualify as its child
+PARENT_EDGE_DISTANCE_PX = 50     # ≈ 107 m: AND the two anchor bboxes must be within
+                                 # this edge-to-edge distance (the tighter gate;
+                                 # protects against center-only links across gaps)
+# Override rule: a low-value anchor whose primary center sits inside (or
+# within NEARLY_IN_PX of) a high-value anchor's bbox links regardless of
+# center distance. Catches "small lone anchor sitting inside a big rich
+# anchor's footprint" cases where the rich anchor's bbox is so large that
+# the centers are far apart but they're geographically the same area.
+PARENT_NEARLY_IN_PX = 25         # ≈  54 m
+
+# Categories considered "small tier" for the low-value classifier — a
+# feature that's just a small scale variant rather than a real structural
+# feature. A 1-primary-1-secondary anchor still counts as low-value if the
+# secondary is in this set.
+SMALL_TIER_CATEGORIES = {
+    "POINT_R13", "POINT_R26", "POCKET_R13", "POCKET_R26",
+    "OYSTER_BAR", "SEAGRASS_BED_SMALL",
+}
 
 # Categories grouped by what they describe physically. Only intra-group pairs
 # can be duplicates.
@@ -640,6 +689,88 @@ def cluster_into_anchors(kept: list[dict],
     return anchors
 
 
+# ---- Phase 3b: anchor-of-anchors parent/child links ----
+
+
+def _bbox_to_bbox_distance(a: list[int], b: list[int]) -> float:
+    """Minimum Euclidean distance between two axis-aligned bboxes (0 if they
+    overlap or touch).
+    """
+    dx = max(b[0] - a[2], a[0] - b[2], 0)
+    dy = max(b[1] - a[3], a[1] - b[3], 0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _is_low_value_anchor(anchor: dict) -> bool:
+    """A low-value anchor has either no secondaries, or a single small-tier
+    secondary. See SMALL_TIER_CATEGORIES.
+    """
+    secondary = anchor.get("secondary", [])
+    if len(secondary) == 0:
+        return True
+    if len(secondary) == 1 and secondary[0]["category"] in SMALL_TIER_CATEGORIES:
+        return True
+    return False
+
+
+def link_parent_child(anchors: list[dict],
+                      center_distance: int = PARENT_CENTER_DISTANCE_PX,
+                      edge_distance: int = PARENT_EDGE_DISTANCE_PX,
+                      nearly_in: int = PARENT_NEARLY_IN_PX) -> None:
+    """Mutate each anchor in place, adding `parent_anchor_id` (str | None)
+    and `child_anchor_ids` (list[str]).
+
+    Greedy single pass: every low-value anchor picks its single closest
+    qualifying high-value parent. A pair qualifies if EITHER:
+      (A) primary-to-primary center distance <= center_distance
+          AND anchor-bbox edge-to-edge distance <= edge_distance
+      (B) low-value primary center is inside (or within nearly_in of)
+          the high-value anchor's bbox. This overrides the center-distance
+          cap and catches cases where the rich anchor's bbox is so large
+          that their centers are far apart but the lone low-value anchor
+          sits geographically inside the rich anchor's footprint.
+
+    Tie-breaker between qualifying parents: smallest center-to-center
+    distance wins.
+
+    No chains, no re-parenting: a low-value anchor that becomes someone's
+    child is not subsequently treated as a parent. Habitat anchors may be
+    either parent or child.
+    """
+    for a in anchors:
+        a.setdefault("parent_anchor_id", None)
+        a.setdefault("child_anchor_ids", [])
+
+    low = [a for a in anchors if _is_low_value_anchor(a)]
+    high = [a for a in anchors if not _is_low_value_anchor(a)]
+
+    for child in low:
+        cpc = child["primary"]["pixel_center"]
+        cbb = child["anchor_bbox"]
+        best_parent: dict | None = None
+        best_d = float("inf")
+        for parent in high:
+            if parent["id"] == child["id"]:
+                continue
+            ppc = parent["primary"]["pixel_center"]
+            pbb = parent["anchor_bbox"]
+            center_d = _euclidean(cpc, ppc)
+            edge_d = _bbox_to_bbox_distance(cbb, pbb)
+            in_d = _distance_point_to_bbox(cpc, pbb)
+            qualifies = (
+                (center_d <= center_distance and edge_d <= edge_distance)
+                or in_d <= nearly_in
+            )
+            if not qualifies:
+                continue
+            if center_d < best_d:
+                best_d = center_d
+                best_parent = parent
+        if best_parent is not None:
+            child["parent_anchor_id"] = best_parent["id"]
+            best_parent["child_anchor_ids"].append(child["id"])
+
+
 # ---- Rendering ----
 
 
@@ -733,6 +864,23 @@ def render_combined_overlay(base_image_path: Path,
             width = 1
         draw.rectangle([ax0, ay0, ax1, ay1], outline=outline, width=width)
 
+    # Pass 1b: draw parent<->child connecting lines (Phase 3b). Goes under
+    # the dots so the primary markers sit on top of the line endpoints.
+    by_id = {a["id"]: a for a in anchors}
+    for child in anchors:
+        parent_id = child.get("parent_anchor_id")
+        if not parent_id:
+            continue
+        parent = by_id.get(parent_id)
+        if parent is None:
+            continue
+        cx, cy = child["primary"]["pixel_center"]
+        px, py = parent["primary"]["pixel_center"]
+        # Black under-stroke for contrast on light backgrounds, then a yellow
+        # stroke on top so it pops against the satellite + tint.
+        draw.line([(cx, cy), (px, py)], fill=(0, 0, 0, 220), width=4)
+        draw.line([(cx, cy), (px, py)], fill=(255, 220, 80, 230), width=2)
+
     # Pass 2: draw secondary dots (so primaries render on top of them).
     for anchor in anchors:
         for sec in anchor["secondary"]:
@@ -778,13 +926,16 @@ def render_combined_overlay(base_image_path: Path,
     n_kept = sum(1 + len(a["secondary"]) for a in anchors)
     n_struct = sum(1 for a in anchors if a.get("type") == "structural")
     n_habitat = sum(1 for a in anchors if a.get("type") == "habitat")
+    n_children = sum(1 for a in anchors if a.get("parent_anchor_id") is not None)
+    n_parents = sum(1 for a in anchors if a.get("child_anchor_ids"))
     legend_draw.text(
         (10, panel_y0 + 8),
-        f"Phase 3a: dedup + cluster + habitat.  "
-        f"{n_struct} structural + {n_habitat} habitat anchors, "
-        f"{n_kept} member features, {len(dropped)} dedup-dropped.  "
-        f"Sec radius {SECONDARY_RADIUS_PX} px, tert {TERTIARY_RADIUS_PX} px, "
-        f"footprint cap {ANCHOR_FOOTPRINT_CAP_PX} px.",
+        f"Phase 3b: {n_struct} structural + {n_habitat} habitat anchors  |  "
+        f"{n_kept} member features, {len(dropped)} dedup-dropped  |  "
+        f"{n_children} child links to {n_parents} parents (yellow lines)  |  "
+        f"sec={SECONDARY_RADIUS_PX}px tert={TERTIARY_RADIUS_PX}px "
+        f"cap={ANCHOR_FOOTPRINT_CAP_PX}px "
+        f"parent={PARENT_CENTER_DISTANCE_PX}/{PARENT_EDGE_DISTANCE_PX}/{PARENT_NEARLY_IN_PX}px",
         fill=(255, 255, 255, 255), font=title_font,
     )
 
@@ -834,15 +985,32 @@ def render_combined_overlay(base_image_path: Path,
             sec_summary = sec_summary[:67] + "..."
         within = anchor.get("within_seagrass_bed_ids") or []
         within_str = f" inSG=[{','.join(within)}]" if within else ""
+        parent_id = anchor.get("parent_anchor_id")
+        children = anchor.get("child_anchor_ids") or []
+        rel_str = ""
+        if parent_id:
+            rel_str = f"  -> parent={parent_id.upper()}"
+        elif children:
+            rel_str = f"  <- children=[{','.join(c.upper() for c in children)}]"
         line = (
             f"{anchor['id'].upper():<3s} "
             f"{primary['id']:>4s} {primary['category']:<14s} @{cell:<3s} "
             f"sec[{len(anchor['secondary'])}]={sec_summary}  "
-            f"tert={len(anchor['tertiary_refs'])}{within_str}"
+            f"tert={len(anchor['tertiary_refs'])}{within_str}{rel_str}"
         )
-        # Habitat anchors get a teal-tinted line so they stand out in the list.
-        text_color = ((180, 240, 220, 255) if anchor.get("type") == "habitat"
-                      else (255, 255, 255, 255))
+        # Color-coding:
+        #   - habitat anchor: teal
+        #   - structural child of someone: dim yellow (matches link line)
+        #   - structural parent of children: bright yellow
+        #   - structural standalone: white
+        if anchor.get("type") == "habitat":
+            text_color = (180, 240, 220, 255)
+        elif parent_id:
+            text_color = (220, 200, 130, 255)
+        elif children:
+            text_color = (255, 230, 100, 255)
+        else:
+            text_color = (255, 255, 255, 255)
         legend_draw.text((28, y), line, fill=text_color, font=legend_font)
         y += line_h
     if len(anchors) > max_lines:
@@ -919,6 +1087,18 @@ def run_one(cell_id: str) -> int:
           f"secondary={n_secondary}, "
           f"{n_with_sg} anchors flagged within_seagrass_bed)")
 
+    # Phase 3b: parent/child links between low-value and high-value anchors
+    link_parent_child(anchors,
+                      center_distance=PARENT_CENTER_DISTANCE_PX,
+                      edge_distance=PARENT_EDGE_DISTANCE_PX)
+    n_children = sum(1 for a in anchors if a.get("parent_anchor_id") is not None)
+    n_parents = sum(1 for a in anchors if a.get("child_anchor_ids"))
+    n_low = sum(1 for a in anchors if _is_low_value_anchor(a))
+    print(f"  link3b: {n_low} low-value anchors -> "
+          f"{n_children} linked as children to {n_parents} parents "
+          f"(center<={PARENT_CENTER_DISTANCE_PX}px AND edge<={PARENT_EDGE_DISTANCE_PX}px, "
+          f"or low-center within {PARENT_NEARLY_IN_PX}px of high-bbox)")
+
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     overlay_path = out_dir / f"cv_all_{ts}.png"
     json_path = out_dir / f"cv_all_{ts}.json"
@@ -945,17 +1125,22 @@ def run_one(cell_id: str) -> int:
 
     json_path.write_text(json.dumps({
         "cell_id": cell_id,
-        "phase": "3a",
+        "phase": "3b",
         "dedup_distance_px": DEDUP_DISTANCE_PX,
         "secondary_radius_px": SECONDARY_RADIUS_PX,
         "tertiary_radius_px": TERTIARY_RADIUS_PX,
         "anchor_footprint_cap_px": ANCHOR_FOOTPRINT_CAP_PX,
+        "parent_center_distance_px": PARENT_CENTER_DISTANCE_PX,
+        "parent_edge_distance_px": PARENT_EDGE_DISTANCE_PX,
+        "parent_nearly_in_px": PARENT_NEARLY_IN_PX,
         "loaded_per_source": per_source_counts,
         "kept_count": len(kept),
         "dropped_count": len(dropped),
         "anchor_count": len(anchors),
         "structural_anchor_count": sum(1 for a in anchors if a.get("type") == "structural"),
         "habitat_anchor_count": sum(1 for a in anchors if a.get("type") == "habitat"),
+        "parent_anchor_count": sum(1 for a in anchors if a.get("child_anchor_ids")),
+        "child_anchor_count": sum(1 for a in anchors if a.get("parent_anchor_id") is not None),
         "habitat_summary": habitat_summary,
         "anchors": [
             {
@@ -966,6 +1151,8 @@ def run_one(cell_id: str) -> int:
                 "secondary": [_light_record(s) for s in a["secondary"]],
                 "tertiary_refs": a["tertiary_refs"],
                 "within_seagrass_bed_ids": a.get("within_seagrass_bed_ids", []),
+                "parent_anchor_id": a.get("parent_anchor_id"),
+                "child_anchor_ids": a.get("child_anchor_ids", []),
             }
             for a in anchors
         ],
