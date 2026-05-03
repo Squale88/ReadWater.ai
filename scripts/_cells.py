@@ -140,19 +140,24 @@ def _build_cell(parent: str, cell_num: int) -> dict:
 
 # --- The public CELLS dict ---
 #
-# 8 cells total:
+# 9 cells total:
 #   - 2 originals kept for A/B comparability with prior evidence runs
-#   - 6 new cells added for broader validation before committing to the
-#     next architectural layer (candidate-feature generation).
+#   - 6 added for broader validation before committing to the next
+#     architectural layer (candidate-feature generation).
+#   - root-2-2 added for water-mask fresh-water-suppression work
+#     (Naples-area cell with residential finger-canal subdivisions —
+#     a worst case for distinguishing inshore saltwater from inland
+#     freshwater features).
 _CELL_ORDER = [
     ("root-10", 8),    # original — mangrove drain + creek mouths
     ("root-11", 5),    # original — open basin, few organizing features
-    ("root-6",  10),   # new — interior bay, mangrove island cluster
-    ("root-2",  9),    # new — NW coves with narrow tidal cuts
-    ("root-7",  14),   # new — charted channel + grass flats
-    ("root-10", 3),    # new — north edge of root-10, creek system
-    ("root-11", 1),    # new — NW corner of root-11, point/cove mix
-    ("root-15", 3),    # new — south bay, charted pass + oyster shoals
+    ("root-6",  10),   # interior bay, mangrove island cluster
+    ("root-2",  9),    # NW coves with narrow tidal cuts
+    ("root-7",  14),   # charted channel + grass flats
+    ("root-10", 3),    # north edge of root-10, creek system
+    ("root-11", 1),    # NW corner of root-11, point/cove mix
+    ("root-15", 3),    # south bay, charted pass + oyster shoals
+    ("root-2",  2),    # Naples residential canals — fresh-water-suppression test
 ]
 
 CELLS: dict[str, dict] = {
