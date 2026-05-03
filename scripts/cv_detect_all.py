@@ -1,20 +1,27 @@
-"""CV-feature orchestrator (Phase 1: dedup + combined render).
+"""CV-feature orchestrator (Phase 1: dedup + Phase 2: anchor clustering).
 
 Reads the latest JSON output from each per-feature detector for a cell:
-  cv_detect_drains.py   →  cv_drains_<ts>.json   (DRAIN / CREEK_MOUTH / LARGE_POCKET / SHOAL)
-  cv_detect_islands.py  →  cv_islands_<ts>.json  (ISLAND_SMALL/MEDIUM/LARGE)
-  cv_detect_points.py   →  cv_points_<ts>.json   (POINT_R13 / POINT_R26)
-  cv_detect_pockets.py  →  cv_pockets_<ts>.json  (POCKET_R13 / POCKET_R26)
+  cv_detect_drains.py   ->  cv_drains_<ts>.json   (DRAIN / CREEK_MOUTH / LARGE_POCKET / SHOAL)
+  cv_detect_islands.py  ->  cv_islands_<ts>.json  (ISLAND_SMALL/MEDIUM/LARGE)
+  cv_detect_points.py   ->  cv_points_<ts>.json   (POINT_R13 / POINT_R26)
+  cv_detect_pockets.py  ->  cv_pockets_<ts>.json  (POCKET_R13 / POCKET_R26)
 
-Drops "true duplicates" (same physical feature detected by two detectors at the
-same place, or detected at two scales of one detector), then renders a single
-combined overlay PNG showing every kept candidate color-coded by category.
-Writes a combined JSON listing every kept candidate.
+PIPELINE
 
-Phase 1 deliberately stops here — no anchor hierarchy (primary/secondary/
-tertiary), no habitat overlay. Those land in Phase 2 and Phase 3.
+  Phase 1 (dedup): drop "true duplicates" — same physical feature detected
+  by two detectors at the same place, or detected at two scales of one
+  detector.
 
-DEDUP MODEL
+  Phase 2 (cluster): group surviving candidates into ANCHORs. Each anchor
+  has one PRIMARY (the largest feature in the group), zero or more
+  SECONDARY (other features touching or near the primary's bbox), and
+  zero or more TERTIARY references (feature ids that belong to OTHER
+  anchors but happen to be within the tertiary radius of this anchor's
+  primary center).
+
+  Phase 3 (habitat overlay) — not yet implemented.
+
+DEDUP MODEL (Phase 1)
 
 Two candidates are "duplicates" iff:
   (1) their pixel_centers are within DEDUP_DISTANCE_PX of each other, AND
@@ -33,6 +40,23 @@ Within a duplicate pair, the higher-priority category wins. CATEGORY_PRIORITY
 defines the order. Priority is roughly "more comprehensive / more informative"
 first; e.g. DRAIN > LARGE_POCKET (a drain says more than just "pocket exists")
 and POINT_R26 > POINT_R13 (R26 catches the same shape with more pixels).
+
+CLUSTERING MODEL (Phase 2)
+
+  - Sort surviving candidates by bbox area DESCENDING (largest first;
+    tie-breaker = CATEGORY_PRIORITY). This makes "more encompassing"
+    features get to claim their cluster first.
+  - Greedy: pop the next unassigned candidate as a primary. Find every
+    OTHER unassigned candidate whose center is within SECONDARY_RADIUS_PX
+    of the primary's bbox. Those become secondary; mark them assigned.
+  - After all primaries are assigned, do a tertiary pass: for each anchor,
+    list candidate ids that belong to OTHER anchors but whose centers sit
+    within TERTIARY_RADIUS_PX of THIS anchor's primary center. These are
+    "neighbor" features — informational only; they're owned by a different
+    anchor. The same feature can be tertiary of multiple anchors.
+
+  Each member candidate has exactly ONE home anchor where it's primary or
+  secondary; tertiary is a non-exclusive nearby-features list.
 
 Input:  data/areas/rookery_bay_v2/images/structures/<cell>/cv_drains_*.json
         data/areas/rookery_bay_v2/images/structures/<cell>/cv_islands_*.json
@@ -68,6 +92,13 @@ from _cv_helpers import (  # noqa: E402
 
 DEDUP_DISTANCE_PX = 15        # centers within this many px = same physical feature
 
+# ---- Clustering parameters ----
+
+SECONDARY_RADIUS_PX = 75      # other-feature center within this distance of primary's
+                              # bbox -> secondary of that anchor
+TERTIARY_RADIUS_PX = 200      # primary-center to other-anchor-member-center within this
+                              # -> tertiary reference (informational only)
+
 # Categories grouped by what they describe physically. Only intra-group pairs
 # can be duplicates.
 GROUP_WATER_NARROW = {
@@ -86,7 +117,8 @@ def category_group(category: str) -> str | None:
 
 
 # Priority for dedup tie-breaking. Higher = preferred when categories collide
-# at the same physical location. Roughly "more informative" first.
+# at the same physical location. Roughly "more informative" first. Used by
+# Phase 1 dedup only.
 CATEGORY_PRIORITY = {
     # narrow water (drains beats pockets when they describe the same throat)
     "DRAIN":         100,
@@ -103,6 +135,28 @@ CATEGORY_PRIORITY = {
     # narrow land (R26 catches same shape with more pixels than R13)
     "POINT_R26":      45,
     "POINT_R13":      35,
+}
+
+# Priority for choosing the PRIMARY of an anchor group in Phase 2 clustering.
+# Different from CATEGORY_PRIORITY: islands are always primary when present in
+# a cluster, because an island is a discrete physical entity while drains /
+# pockets / points / shoals are characteristics OF an area. Within tiers,
+# bbox area breaks ties.
+CLUSTER_PRIMARY_PRIORITY = {
+    # Tier 1: discrete land bodies — always preferred as primary when in cluster
+    "ISLAND_LARGE":   100,
+    "ISLAND_MEDIUM":   90,
+    "ISLAND_SMALL":    80,
+    # Tier 2: comprehensive water features
+    "DRAIN":           70,
+    "CREEK_MOUTH":     65,
+    "LARGE_POCKET":    60,
+    "SHOAL":           55,
+    # Tier 3: detector-specific scale tiers (less comprehensive)
+    "POINT_R26":       40,
+    "POCKET_R26":      40,
+    "POINT_R13":       30,
+    "POCKET_R13":      30,
 }
 
 
@@ -231,22 +285,112 @@ def dedup_candidates(candidates: list[dict]) -> tuple[list[dict], list[dict]]:
     return kept_list, dropped_list
 
 
+# ---- Clustering ----
+
+
+def _distance_point_to_bbox(point: list[float], bbox: list[int]) -> float:
+    """Min Euclidean distance from a point to a bbox (0 if inside)."""
+    x, y = point
+    dx = max(bbox[0] - x, 0, x - bbox[2])
+    dy = max(bbox[1] - y, 0, y - bbox[3])
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _euclidean(a: list[float], b: list[float]) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def _union_bbox(bboxes: list[list[int]]) -> list[int]:
+    if not bboxes:
+        return [0, 0, 0, 0]
+    return [
+        min(b[0] for b in bboxes),
+        min(b[1] for b in bboxes),
+        max(b[2] for b in bboxes),
+        max(b[3] for b in bboxes),
+    ]
+
+
+def cluster_into_anchors(kept: list[dict],
+                         secondary_radius: int = SECONDARY_RADIUS_PX,
+                         tertiary_radius: int = TERTIARY_RADIUS_PX) -> list[dict]:
+    """Group surviving (post-dedup) candidates into anchor groups.
+
+    Each candidate goes into exactly one anchor as either primary or secondary.
+    Tertiary is recorded as a list of candidate IDs that belong to OTHER
+    anchors but happen to be within tertiary_radius of this anchor's primary
+    center — informational, non-exclusive.
+
+    Returns a list of anchor dicts, each with:
+      id (a1, a2, ...), primary, secondary (list), tertiary_refs (list of IDs),
+      anchor_bbox (union of primary + secondary bboxes).
+    """
+    # Sort: highest CLUSTER_PRIMARY_PRIORITY first; tie-breaker = bbox area
+    # (largest first). This puts ISLAND_* ahead of all water features for
+    # primary selection, matching the user intent that a discrete landmass
+    # encompasses surrounding features.
+    sorted_cands = sorted(
+        kept,
+        key=lambda c: (-CLUSTER_PRIMARY_PRIORITY.get(c["category"], 0),
+                       -_bbox_area(c["pixel_bbox"])),
+    )
+
+    assigned: set[str] = set()
+    anchors: list[dict] = []
+
+    for primary in sorted_cands:
+        if primary["id"] in assigned:
+            continue
+        secondary: list[dict] = []
+        for other in kept:
+            if other["id"] in assigned or other["id"] == primary["id"]:
+                continue
+            d = _distance_point_to_bbox(other["pixel_center"], primary["pixel_bbox"])
+            if d <= secondary_radius:
+                secondary.append(other)
+                assigned.add(other["id"])
+        assigned.add(primary["id"])
+        anchor_bbox = _union_bbox(
+            [primary["pixel_bbox"]] + [s["pixel_bbox"] for s in secondary]
+        )
+        anchors.append({
+            "id": f"a{len(anchors) + 1}",
+            "primary": primary,
+            "secondary": secondary,
+            "anchor_bbox": anchor_bbox,
+            "tertiary_refs": [],   # filled in below
+        })
+
+    # Tertiary pass: features in OTHER anchors within tertiary_radius of THIS
+    # anchor's primary center (non-exclusive — same feature can be tertiary
+    # of multiple anchors).
+    for anchor in anchors:
+        member_ids = {anchor["primary"]["id"]} | {s["id"] for s in anchor["secondary"]}
+        primary_center = anchor["primary"]["pixel_center"]
+        for other in kept:
+            if other["id"] in member_ids:
+                continue
+            if _euclidean(primary_center, other["pixel_center"]) <= tertiary_radius:
+                anchor["tertiary_refs"].append(other["id"])
+
+    return anchors
+
+
 # ---- Rendering ----
 
 
-LEGEND_PANEL_HEIGHT = 320     # px below the satellite for the off-image legend
+LEGEND_PANEL_HEIGHT = 480     # px below the satellite for the off-image legend
 LEGEND_FONT_SIZE = 13
 
 
 def render_combined_overlay(base_image_path: Path,
-                            kept: list[dict],
+                            anchors: list[dict],
                             dropped: list[dict],
                             output_path: Path,
                             image_size: tuple[int, int] = (1280, 1280)) -> Path:
     base = Image.open(base_image_path).convert("RGBA")
     canvas = Image.new("RGBA", (image_size[0], image_size[1] + LEGEND_PANEL_HEIGHT),
                        (20, 20, 20, 255))
-    canvas.paste(base, (0, 0))
 
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer, "RGBA")
@@ -280,26 +424,51 @@ def render_combined_overlay(base_image_path: Path,
                         draw.text((tx + dx, ty + dy), text, fill="black", font=grid_font)
             draw.text((tx, ty), text, fill="white", font=grid_font)
 
-    # Plot each kept candidate as a colored dot + short id label
     label_font = load_font(13)
-    for cand in kept:
-        cx, cy = cand["pixel_center"]
-        color = CATEGORY_COLOR.get(cand["category"], (200, 200, 200, 255))
-        r = 6
+    primary_label_font = load_font(16)
+
+    # Pass 1: draw each anchor's bounding rectangle (faint gray) so the
+    # cluster footprint is visible.
+    for anchor in anchors:
+        ax0, ay0, ax1, ay1 = anchor["anchor_bbox"]
+        # Pad a few pixels so the box visually contains the dots
+        ax0 -= 6; ay0 -= 6; ax1 += 6; ay1 += 6
+        draw.rectangle([ax0, ay0, ax1, ay1],
+                       outline=(220, 220, 220, 140), width=1)
+
+    # Pass 2: draw secondary dots (so primaries render on top of them).
+    for anchor in anchors:
+        for sec in anchor["secondary"]:
+            cx, cy = sec["pixel_center"]
+            color = CATEGORY_COLOR.get(sec["category"], (200, 200, 200, 255))
+            r = 5
+            draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                         fill=color, outline=(0, 0, 0, 255), width=1)
+            text = sec["id"]
+            tx = int(cx) + 7; ty = int(cy) - 12
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx or dy:
+                        draw.text((tx + dx, ty + dy), text, fill="black", font=label_font)
+            draw.text((tx, ty), text, fill=color, font=label_font)
+
+    # Pass 3: draw primaries (larger dot + anchor id like a1).
+    for anchor in anchors:
+        primary = anchor["primary"]
+        cx, cy = primary["pixel_center"]
+        color = CATEGORY_COLOR.get(primary["category"], (200, 200, 200, 255))
+        r = 9
         draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                      fill=color, outline=(255, 255, 255, 255), width=2)
-        # Label: just the source-detector id (already short — c1, i3, p7, k2)
-        text = cand["id"]
-        tx = int(cx) + 8
-        ty = int(cy) - 14
+        text = anchor["id"].upper()
+        tx = int(cx) + 11; ty = int(cy) - 16
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 if dx or dy:
-                    draw.text((tx + dx, ty + dy), text, fill="black", font=label_font)
-        draw.text((tx, ty), text, fill=color, font=label_font)
+                    draw.text((tx + dx, ty + dy), text,
+                              fill="black", font=primary_label_font)
+        draw.text((tx, ty), text, fill=color, font=primary_label_font)
 
-    Image.alpha_composite(base.convert("RGBA"), layer).convert("RGB").paste(
-        Image.new("RGB", base.size), (0, 0))   # noop, just to keep base shape
     composed_top = Image.alpha_composite(base, layer)
     canvas.paste(composed_top, (0, 0))
 
@@ -309,64 +478,47 @@ def render_combined_overlay(base_image_path: Path,
     legend_font = load_font(LEGEND_FONT_SIZE)
     title_font = load_font(15)
 
-    # Header row
-    legend_draw.text((10, panel_y0 + 8),
-                     f"Phase 1: dedup-only.  Kept = {len(kept)}, dropped = {len(dropped)} "
-                     f"(dedup distance {DEDUP_DISTANCE_PX} px)",
-                     fill=(255, 255, 255, 255), font=title_font)
+    n_kept = sum(1 + len(a["secondary"]) for a in anchors)
+    legend_draw.text(
+        (10, panel_y0 + 8),
+        f"Phase 2: dedup + cluster.  {len(anchors)} anchors, {n_kept} member features, "
+        f"{len(dropped)} dedup-dropped.  "
+        f"Secondary radius {SECONDARY_RADIUS_PX} px, tertiary {TERTIARY_RADIUS_PX} px.",
+        fill=(255, 255, 255, 255), font=title_font,
+    )
 
-    # Two columns: kept (left), dropped (right)
-    col_w = image_size[0] // 2
     line_h = LEGEND_FONT_SIZE + 4
     header_y = panel_y0 + 32
-    legend_draw.text((10, header_y), "KEPT", fill=(180, 255, 180, 255), font=title_font)
-    legend_draw.text((col_w + 10, header_y), "DROPPED (duplicates)",
-                     fill=(255, 180, 180, 255), font=title_font)
+    legend_draw.text((10, header_y),
+                     "ANCHORS  (primary [secondary count] tertiary count)",
+                     fill=(180, 255, 180, 255), font=title_font)
 
-    # Sort kept by category priority (highest first), then by id
-    kept_sorted = sorted(
-        kept,
-        key=lambda c: (-CATEGORY_PRIORITY.get(c["category"], 0), c["source_detector"], c["id"]),
-    )
     y = header_y + line_h + 4
     max_lines = (LEGEND_PANEL_HEIGHT - (y - panel_y0) - 4) // line_h
-    for cand in kept_sorted[:max_lines]:
-        color = CATEGORY_COLOR.get(cand["category"], (200, 200, 200, 255))
-        cx, cy = cand["pixel_center"]
-        cell = grid_cell_for(cx, cy, image_size)
-        # Color swatch
-        legend_draw.rectangle([10, y + 2, 22, y + LEGEND_FONT_SIZE],
-                              fill=color)
-        # Text
-        line = (f"{cand['source_detector'][:1]}{cand['id']}  {cand['category']:<14s}  "
-                f"@{cell}  ({int(cx)},{int(cy)})")
-        legend_draw.text((28, y), line,
-                         fill=(255, 255, 255, 255), font=legend_font)
+    for anchor in anchors[:max_lines]:
+        primary = anchor["primary"]
+        color = CATEGORY_COLOR.get(primary["category"], (200, 200, 200, 255))
+        pcx, pcy = primary["pixel_center"]
+        cell = grid_cell_for(pcx, pcy, image_size)
+        legend_draw.rectangle([10, y + 2, 22, y + LEGEND_FONT_SIZE], fill=color)
+        sec_summary = ", ".join(
+            f"{s['id']}/{s['category']}" for s in anchor["secondary"]
+        )
+        if not sec_summary:
+            sec_summary = "—"
+        if len(sec_summary) > 90:
+            sec_summary = sec_summary[:87] + "..."
+        line = (
+            f"{anchor['id'].upper():<3s} "
+            f"{primary['id']:>4s} {primary['category']:<13s} @{cell:<3s} "
+            f"sec[{len(anchor['secondary'])}]={sec_summary}  tert={len(anchor['tertiary_refs'])}"
+        )
+        legend_draw.text((28, y), line, fill=(255, 255, 255, 255), font=legend_font)
         y += line_h
-    if len(kept_sorted) > max_lines:
+    if len(anchors) > max_lines:
         legend_draw.text((28, y),
-                         f"... +{len(kept_sorted) - max_lines} more (see JSON)",
+                         f"... +{len(anchors) - max_lines} more anchors (see JSON)",
                          fill=(180, 180, 180, 255), font=legend_font)
-
-    # Dropped column
-    y = header_y + line_h + 4
-    for cand in dropped:
-        if (y - panel_y0) > LEGEND_PANEL_HEIGHT - line_h - 4:
-            legend_draw.text((col_w + 28, y),
-                             f"... +{len(dropped) - ((y - header_y - line_h - 4) // line_h)} more",
-                             fill=(180, 180, 180, 255), font=legend_font)
-            break
-        color = CATEGORY_COLOR.get(cand["category"], (200, 200, 200, 255))
-        cx, cy = cand["pixel_center"]
-        cell = grid_cell_for(cx, cy, image_size)
-        legend_draw.rectangle([col_w + 10, y + 2, col_w + 22, y + LEGEND_FONT_SIZE],
-                              fill=color)
-        winner = cand.get("dropped_for", {})
-        line = (f"{cand['id']} {cand['category']:<13s} @{cell} "
-                f"-> {winner.get('winner_id', '?')}/{winner.get('winner_category', '?')}")
-        legend_draw.text((col_w + 28, y), line,
-                         fill=(255, 255, 255, 255), font=legend_font)
-        y += line_h
 
     canvas.convert("RGB").save(output_path)
     return output_path
@@ -409,34 +561,67 @@ def run_one(cell_id: str) -> int:
           f"(threshold {DEDUP_DISTANCE_PX} px)")
 
     if dropped:
-        print(f"\n  Dropped duplicates (loser -> winner):")
+        print(f"  Dropped duplicates (loser -> winner):")
         for d in dropped:
             w = d["dropped_for"]
             print(f"    {d['source_detector'][:7]:<7s} {d['id']:>4s} {d['category']:<14s}"
                   f"  ->  {w['winner_source'][:7]:<7s} {w['winner_id']:>4s} {w['winner_category']}")
 
+    # Phase 2: cluster surviving candidates into anchor groups
+    anchors = cluster_into_anchors(kept,
+                                    secondary_radius=SECONDARY_RADIUS_PX,
+                                    tertiary_radius=TERTIARY_RADIUS_PX)
+    n_secondary = sum(len(a["secondary"]) for a in anchors)
+    print(f"  cluster: {len(anchors)} anchors  "
+          f"(primary={len(anchors)}, secondary={n_secondary}, "
+          f"tertiary refs avg={sum(len(a['tertiary_refs']) for a in anchors) / max(1, len(anchors)):.1f})")
+
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     overlay_path = out_dir / f"cv_all_{ts}.png"
     json_path = out_dir / f"cv_all_{ts}.json"
 
-    render_combined_overlay(z16_path, kept, dropped, overlay_path)
+    render_combined_overlay(z16_path, anchors, dropped, overlay_path)
+
+    # JSON: medium-with-pointers per anchor; full source records in `members`
+    def _light_record(c: dict) -> dict:
+        return {
+            "id": c["id"],
+            "category": c["category"],
+            "source_detector": c["source_detector"],
+            "pixel_center": c["pixel_center"],
+            "pixel_bbox": c["pixel_bbox"],
+        }
+
+    members_blob: dict[str, dict] = {}
+    for a in anchors:
+        for m in [a["primary"]] + a["secondary"]:
+            members_blob[m["id"]] = m["extra"]
 
     json_path.write_text(json.dumps({
         "cell_id": cell_id,
-        "phase": 1,
+        "phase": 2,
         "dedup_distance_px": DEDUP_DISTANCE_PX,
+        "secondary_radius_px": SECONDARY_RADIUS_PX,
+        "tertiary_radius_px": TERTIARY_RADIUS_PX,
         "loaded_per_source": per_source_counts,
         "kept_count": len(kept),
         "dropped_count": len(dropped),
-        "kept": [
-            {k: v for k, v in c.items() if k != "extra"}
-            | {"extra": c["extra"]}
-            for c in kept
+        "anchor_count": len(anchors),
+        "anchors": [
+            {
+                "id": a["id"],
+                "anchor_bbox": a["anchor_bbox"],
+                "primary": _light_record(a["primary"]),
+                "secondary": [_light_record(s) for s in a["secondary"]],
+                "tertiary_refs": a["tertiary_refs"],
+            }
+            for a in anchors
         ],
+        "members": members_blob,
         "dropped": dropped,
     }, indent=2, default=str), encoding="utf-8")
 
-    print(f"\n  overlay: {overlay_path.relative_to(REPO_ROOT)}")
+    print(f"  overlay: {overlay_path.relative_to(REPO_ROOT)}")
     print(f"  json:    {json_path.relative_to(REPO_ROOT)}")
     return 0
 
