@@ -30,6 +30,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EDGE_MARGIN_PX = 6         # bbox within this many pixels of the frame -> is_edge_truncated
 SMOOTH_RADIUS = 4          # boundary smoothing kernel applied to every mask
 GOOGLE_WATER_DIR = REPO_ROOT / "data" / "areas" / "rookery_bay_v2_google_water"
+HABITAT_DIR = REPO_ROOT / "data" / "areas" / "rookery_bay_v2_habitats"
+
+
+# ---- Habitat mask loading ----
+
+
+def load_habitat_mask(cell_id: str, kind: str,
+                      image_size: tuple[int, int] = (1280, 1280)
+                      ) -> np.ndarray | None:
+    """Load an FWC habitat mask for a cell as a boolean array.
+
+    `kind` is "seagrass" or "oyster". The on-disk file lives at
+    ``data/areas/rookery_bay_v2_habitats/<cell>_<kind>_mask.png``
+    and is a single-channel 8-bit PNG with 0 = absent, 255 = present.
+    Returns None if the file isn't on disk.
+    """
+    p = HABITAT_DIR / f"{cell_id}_{kind}_mask.png"
+    if not p.exists():
+        return None
+    img = Image.open(p).convert("L")
+    if img.size != image_size:
+        img = img.resize(image_size, Image.NEAREST)
+    return np.array(img) > 127
 
 
 # ---- Pure-numpy 4-connected morphology ----
