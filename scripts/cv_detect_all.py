@@ -1,10 +1,16 @@
-"""CV-feature orchestrator (Phase 1: dedup + Phase 2: anchor clustering).
+"""CV-feature orchestrator (Phase 1: dedup + Phase 2: anchor clustering +
+Phase 3a: habitat).
 
 Reads the latest JSON output from each per-feature detector for a cell:
   cv_detect_drains.py   ->  cv_drains_<ts>.json   (DRAIN / CREEK_MOUTH / LARGE_POCKET / SHOAL)
   cv_detect_islands.py  ->  cv_islands_<ts>.json  (ISLAND_SMALL/MEDIUM/LARGE)
   cv_detect_points.py   ->  cv_points_<ts>.json   (POINT_R13 / POINT_R26)
   cv_detect_pockets.py  ->  cv_pockets_<ts>.json  (POCKET_R13 / POCKET_R26)
+
+Plus, as of Phase 3a, runs habitat detection inline (no separate detector
+script) on the FWC SAV / oyster-reef rasters:
+  data/areas/rookery_bay_v2_habitats/<cell>_seagrass_mask.png
+  data/areas/rookery_bay_v2_habitats/<cell>_oyster_mask.png
 
 PIPELINE
 
@@ -19,7 +25,20 @@ PIPELINE
   anchors but happen to be within the tertiary radius of this anchor's
   primary center).
 
-  Phase 3 (habitat overlay) — not yet implemented.
+  Phase 3a (habitat): seagrass beds and oyster reefs feed the same dedup +
+  clustering pipeline as a regular candidate stream, with category-driven
+  primary priority:
+    - SEAGRASS_BED_LARGE  (CC area >= 10000 px) — substantial bed; allowed
+      to be primary (priority just below ISLAND_LARGE).
+    - SEAGRASS_BED_MEDIUM ( 1500..10000 px ) — meaningful patch; usually
+      attaches as secondary near a richer anchor.
+    - SEAGRASS_BED_SMALL  (  200.. 1500 px ) — small patch; only primary
+      when nothing else is nearby.
+    - OYSTER_BAR (CC area >= 30 px) — never substantial enough to be
+      primary by itself; primary priority near the floor so it almost
+      always falls into another anchor as secondary or tertiary.
+  Habitat masks are also rendered as semi-transparent tints on the base
+  image so spatial extent is visible alongside the point candidates.
 
 DEDUP MODEL (Phase 1)
 
@@ -32,9 +51,14 @@ Compatibility groups (features that COULD describe the same physical thing):
             (DRAIN, CREEK_MOUTH, LARGE_POCKET, SHOAL, POCKET_R13, POCKET_R26)
   Group L = narrow-land features (POINT_R13, POINT_R26)
   Group I = land bodies (ISLAND_SMALL, ISLAND_MEDIUM, ISLAND_LARGE)
+  Group S = seagrass tiers (SEAGRASS_BED_LARGE/MEDIUM/SMALL) — three size
+            tiers of the SAME physical bed CC are mutually exclusive, but in
+            practice CCs are non-overlapping so dedup is a no-op here.
+  Group O = oyster (OYSTER_BAR)
 
 Cross-group pairs are NOT dedup candidates (water features and land features
-can't be the same physical thing even if they're at the same pixel center).
+can't be the same physical thing even if they're at the same pixel center,
+and habitat features describe different cover-class entities).
 
 Within a duplicate pair, the higher-priority category wins. CATEGORY_PRIORITY
 defines the order. Priority is roughly "more comprehensive / more informative"
@@ -84,8 +108,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _cv_helpers import (  # noqa: E402
     REPO_ROOT,
+    connected_components,
     grid_cell_for,
     load_font,
+    load_habitat_mask,
 )
 
 # ---- Dedup parameters ----
@@ -107,12 +133,16 @@ GROUP_WATER_NARROW = {
 }
 GROUP_LAND_NARROW = {"POINT_R13", "POINT_R26"}
 GROUP_LAND_BODY = {"ISLAND_SMALL", "ISLAND_MEDIUM", "ISLAND_LARGE"}
+GROUP_SEAGRASS = {"SEAGRASS_BED_LARGE", "SEAGRASS_BED_MEDIUM", "SEAGRASS_BED_SMALL"}
+GROUP_OYSTER = {"OYSTER_BAR"}
 
 
 def category_group(category: str) -> str | None:
     if category in GROUP_WATER_NARROW: return "W"
     if category in GROUP_LAND_NARROW:  return "L"
     if category in GROUP_LAND_BODY:    return "I"
+    if category in GROUP_SEAGRASS:     return "S"
+    if category in GROUP_OYSTER:       return "O"
     return None
 
 
@@ -121,20 +151,26 @@ def category_group(category: str) -> str | None:
 # Phase 1 dedup only.
 CATEGORY_PRIORITY = {
     # narrow water (drains beats pockets when they describe the same throat)
-    "DRAIN":         100,
-    "CREEK_MOUTH":    90,
-    "LARGE_POCKET":   80,
-    "SHOAL":          70,
-    "POCKET_R26":     60,
-    "POCKET_R13":     50,
+    "DRAIN":               100,
+    "CREEK_MOUTH":          90,
+    "LARGE_POCKET":         80,
+    "SHOAL":                70,
+    "POCKET_R26":           60,
+    "POCKET_R13":           50,
     # land bodies (larger tier wins; in practice same island can't be in
     # two tiers, but list anyway for completeness)
-    "ISLAND_LARGE":   85,
-    "ISLAND_MEDIUM":  75,
-    "ISLAND_SMALL":   55,
+    "ISLAND_LARGE":         85,
+    "ISLAND_MEDIUM":        75,
+    "ISLAND_SMALL":         55,
     # narrow land (R26 catches same shape with more pixels than R13)
-    "POINT_R26":      45,
-    "POINT_R13":      35,
+    "POINT_R26":            45,
+    "POINT_R13":            35,
+    # habitat (purely for completeness — habitat CCs are non-overlapping
+    # within a layer, so dedup pairs are vanishingly rare)
+    "SEAGRASS_BED_LARGE":   65,
+    "SEAGRASS_BED_MEDIUM":  45,
+    "SEAGRASS_BED_SMALL":   25,
+    "OYSTER_BAR":           20,
 }
 
 # Priority for choosing the PRIMARY of an anchor group in Phase 2 clustering.
@@ -144,37 +180,60 @@ CATEGORY_PRIORITY = {
 # bbox area breaks ties.
 CLUSTER_PRIMARY_PRIORITY = {
     # Tier 1: discrete land bodies — always preferred as primary when in cluster
-    "ISLAND_LARGE":   100,
-    "ISLAND_MEDIUM":   90,
-    "ISLAND_SMALL":    80,
+    "ISLAND_LARGE":         100,
+    # Tier 1.5: substantial seagrass beds — describe a whole productive area
+    # like a small island. Allowed to anchor a cluster but ranked just under
+    # ISLAND_LARGE so that when both are nearby, the discrete landmass wins.
+    "SEAGRASS_BED_LARGE":    95,
+    "ISLAND_MEDIUM":         90,
+    "ISLAND_SMALL":          80,
     # Tier 2: comprehensive water features
-    "DRAIN":           70,
-    "CREEK_MOUTH":     65,
-    "LARGE_POCKET":    60,
-    "SHOAL":           55,
+    "DRAIN":                 70,
+    "CREEK_MOUTH":           65,
+    "LARGE_POCKET":          60,
+    "SHOAL":                 55,
+    # Tier 2.5: medium seagrass beds — meaningful patches but rarely the
+    # most informative thing in a cluster
+    "SEAGRASS_BED_MEDIUM":   50,
     # Tier 3: detector-specific scale tiers (less comprehensive)
-    "POINT_R26":       40,
-    "POCKET_R26":      40,
-    "POINT_R13":       30,
-    "POCKET_R13":      30,
+    "POINT_R26":             40,
+    "POCKET_R26":            40,
+    "POINT_R13":             30,
+    "POCKET_R13":            30,
+    # Tier 4: small habitat — almost never primary unless truly isolated
+    "SEAGRASS_BED_SMALL":    25,
+    "OYSTER_BAR":            15,
 }
 
 
 # ---- Per-category visual rendering (consistent across detectors) ----
 
 CATEGORY_COLOR = {
-    "DRAIN":         (220,  30,  30, 255),    # red
-    "CREEK_MOUTH":   (255, 165,   0, 255),    # orange
-    "LARGE_POCKET":  (255, 230,  50, 255),    # yellow
-    "SHOAL":         ( 60, 200, 230, 255),    # cyan-ish
-    "ISLAND_SMALL":  (150, 230, 100, 255),    # light green
-    "ISLAND_MEDIUM": ( 50, 180,  50, 255),    # medium green
-    "ISLAND_LARGE":  ( 30, 110,  30, 255),    # dark green
-    "POINT_R13":     (255, 150, 200, 255),    # pink
-    "POINT_R26":     (220,  80, 180, 255),    # magenta
-    "POCKET_R13":    (140, 200, 255, 255),    # light blue
-    "POCKET_R26":    ( 30, 110, 200, 255),    # deep blue
+    "DRAIN":               (220,  30,  30, 255),    # red
+    "CREEK_MOUTH":         (255, 165,   0, 255),    # orange
+    "LARGE_POCKET":        (255, 230,  50, 255),    # yellow
+    "SHOAL":               ( 60, 200, 230, 255),    # cyan-ish
+    "ISLAND_SMALL":        (150, 230, 100, 255),    # light green
+    "ISLAND_MEDIUM":       ( 50, 180,  50, 255),    # medium green
+    "ISLAND_LARGE":        ( 30, 110,  30, 255),    # dark green
+    "POINT_R13":           (255, 150, 200, 255),    # pink
+    "POINT_R26":           (220,  80, 180, 255),    # magenta
+    "POCKET_R13":          (140, 200, 255, 255),    # light blue
+    "POCKET_R26":          ( 30, 110, 200, 255),    # deep blue
+    # Habitat — kept distinct from the (water/land) green family so seagrass
+    # markers don't get confused with islands. Teal/turquoise = SAV;
+    # tan/beige = oyster reef.
+    "SEAGRASS_BED_LARGE":  ( 20, 150, 130, 255),    # deep teal
+    "SEAGRASS_BED_MEDIUM": ( 80, 200, 170, 255),    # mid teal
+    "SEAGRASS_BED_SMALL":  (160, 230, 210, 255),    # pale teal
+    "OYSTER_BAR":          (220, 180, 100, 255),    # tan
 }
+
+# Tint colors used to fill the actual habitat extent on the satellite image
+# (rendered before the dot overlay). Alpha is intentionally low so the base
+# satellite is still readable.
+SEAGRASS_TINT_RGBA = ( 40, 200, 170,  90)
+OYSTER_TINT_RGBA   = (245, 220, 130, 220)   # higher alpha — oyster reefs are tiny
 
 
 # ---- IO ----
@@ -214,6 +273,117 @@ def load_detector(cell_id: str, prefix: str, source: str) -> list[dict]:
             "extra": c,                             # preserve everything for downstream
         })
     return out
+
+
+# ---- Habitat candidate detection (Phase 3a) ----
+
+# Seagrass tier thresholds (pixels of CC area). Calibrated against root-10-8
+# and root-11-5 — see scratch/diagnose_no_smooth.py / habitat CC scan.
+SEAGRASS_LARGE_MIN = 10000
+SEAGRASS_MEDIUM_MIN = 1500
+SEAGRASS_SMALL_MIN = 200       # below this we drop the CC entirely
+OYSTER_MIN = 30                # FWC oyster polygons are small; keep most
+
+
+def _classify_seagrass(area: int) -> str | None:
+    if area >= SEAGRASS_LARGE_MIN:  return "SEAGRASS_BED_LARGE"
+    if area >= SEAGRASS_MEDIUM_MIN: return "SEAGRASS_BED_MEDIUM"
+    if area >= SEAGRASS_SMALL_MIN:  return "SEAGRASS_BED_SMALL"
+    return None
+
+
+def _habitat_cc_to_candidate(cc: dict, category: str, idx: int,
+                             source: str, kind: str) -> dict:
+    """Convert a habitat CC to a candidate record matching the same shape as
+    the detector JSON candidates.
+    """
+    cx, cy = cc["center"]
+    x0, y0, x1, y1 = cc["bbox"]
+    short = "s" if kind == "seagrass" else "o"
+    return {
+        "id": f"{short}{idx}",                       # s1, s2, ..., o1, o2
+        "category": category,
+        "source_detector": source,
+        "source_path": "(inline habitat)",
+        "pixel_bbox": [int(x0), int(y0), int(x1), int(y1)],
+        "pixel_center": [int(round(cx)), int(round(cy))],
+        "extra": {
+            "id": f"{short}{idx}",
+            "category": category,
+            "pixel_bbox": [int(x0), int(y0), int(x1), int(y1)],
+            "pixel_center": [int(round(cx)), int(round(cy))],
+            "area_px": int(cc["area"]),
+            "habitat_kind": kind,
+        },
+    }
+
+
+def detect_habitat_candidates(cell_id: str
+                              ) -> tuple[list[dict], list[dict],
+                                         np.ndarray | None, np.ndarray | None,
+                                         dict]:
+    """Run inline habitat detection for a cell.
+
+    Returns:
+        (seagrass_candidates, oyster_candidates,
+         seagrass_mask | None, oyster_mask | None,
+         summary_dict)
+
+    The masks are returned so the renderer can tint them onto the base image.
+    summary_dict has the per-cell aggregate stats for the JSON output.
+    """
+    summary: dict = {}
+
+    # --- Seagrass ---
+    sea_mask = load_habitat_mask(cell_id, "seagrass")
+    sea_cands: list[dict] = []
+    if sea_mask is None:
+        print(f"  [warn] {cell_id}: no seagrass mask found, skipping seagrass")
+        summary["seagrass"] = None
+    else:
+        sea_ccs = connected_components(sea_mask, min_pixels=SEAGRASS_SMALL_MIN)
+        sea_ccs.sort(key=lambda c: -c["area"])
+        idx = 0
+        for cc in sea_ccs:
+            cat = _classify_seagrass(cc["area"])
+            if cat is None:
+                continue
+            idx += 1
+            sea_cands.append(_habitat_cc_to_candidate(cc, cat, idx, "habitat", "seagrass"))
+        summary["seagrass"] = {
+            "total_px": int(sea_mask.sum()),
+            "pct_of_cell": float(sea_mask.mean()),
+            "cc_count": len(sea_ccs),
+            "candidate_count": len(sea_cands),
+            "tier_counts": {
+                "SEAGRASS_BED_LARGE":
+                    sum(1 for c in sea_cands if c["category"] == "SEAGRASS_BED_LARGE"),
+                "SEAGRASS_BED_MEDIUM":
+                    sum(1 for c in sea_cands if c["category"] == "SEAGRASS_BED_MEDIUM"),
+                "SEAGRASS_BED_SMALL":
+                    sum(1 for c in sea_cands if c["category"] == "SEAGRASS_BED_SMALL"),
+            },
+        }
+
+    # --- Oyster ---
+    oys_mask = load_habitat_mask(cell_id, "oyster")
+    oys_cands: list[dict] = []
+    if oys_mask is None:
+        print(f"  [warn] {cell_id}: no oyster mask found, skipping oyster")
+        summary["oyster"] = None
+    else:
+        oys_ccs = connected_components(oys_mask, min_pixels=OYSTER_MIN)
+        oys_ccs.sort(key=lambda c: -c["area"])
+        for i, cc in enumerate(oys_ccs, start=1):
+            oys_cands.append(_habitat_cc_to_candidate(cc, "OYSTER_BAR", i, "habitat", "oyster"))
+        summary["oyster"] = {
+            "total_px": int(oys_mask.sum()),
+            "pct_of_cell": float(oys_mask.mean()),
+            "cc_count": len(oys_ccs),
+            "candidate_count": len(oys_cands),
+        }
+
+    return sea_cands, oys_cands, sea_mask, oys_mask, summary
 
 
 # ---- Dedup ----
@@ -383,14 +553,41 @@ LEGEND_PANEL_HEIGHT = 480     # px below the satellite for the off-image legend
 LEGEND_FONT_SIZE = 13
 
 
+def _tint_layer(mask: np.ndarray, rgba: tuple[int, int, int, int],
+                size: tuple[int, int]) -> Image.Image:
+    """Build an RGBA image of `size` with the given color where mask is True
+    and full transparency elsewhere.
+    """
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    if mask is None or not mask.any():
+        return layer
+    arr = np.zeros((size[1], size[0], 4), dtype=np.uint8)
+    arr[mask, 0] = rgba[0]
+    arr[mask, 1] = rgba[1]
+    arr[mask, 2] = rgba[2]
+    arr[mask, 3] = rgba[3]
+    return Image.fromarray(arr, mode="RGBA")
+
+
 def render_combined_overlay(base_image_path: Path,
                             anchors: list[dict],
                             dropped: list[dict],
                             output_path: Path,
-                            image_size: tuple[int, int] = (1280, 1280)) -> Path:
+                            image_size: tuple[int, int] = (1280, 1280),
+                            seagrass_mask: np.ndarray | None = None,
+                            oyster_mask: np.ndarray | None = None,
+                            habitat_summary: dict | None = None) -> Path:
     base = Image.open(base_image_path).convert("RGBA")
     canvas = Image.new("RGBA", (image_size[0], image_size[1] + LEGEND_PANEL_HEIGHT),
                        (20, 20, 20, 255))
+
+    # ---- Habitat tints (composited under the candidate dots) ----
+    if seagrass_mask is not None:
+        sea_layer = _tint_layer(seagrass_mask, SEAGRASS_TINT_RGBA, base.size)
+        base = Image.alpha_composite(base, sea_layer)
+    if oyster_mask is not None:
+        oys_layer = _tint_layer(oyster_mask, OYSTER_TINT_RGBA, base.size)
+        base = Image.alpha_composite(base, oys_layer)
 
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer, "RGBA")
@@ -481,14 +678,37 @@ def render_combined_overlay(base_image_path: Path,
     n_kept = sum(1 + len(a["secondary"]) for a in anchors)
     legend_draw.text(
         (10, panel_y0 + 8),
-        f"Phase 2: dedup + cluster.  {len(anchors)} anchors, {n_kept} member features, "
-        f"{len(dropped)} dedup-dropped.  "
+        f"Phase 3a: dedup + cluster + habitat.  {len(anchors)} anchors, "
+        f"{n_kept} member features, {len(dropped)} dedup-dropped.  "
         f"Secondary radius {SECONDARY_RADIUS_PX} px, tertiary {TERTIARY_RADIUS_PX} px.",
         fill=(255, 255, 255, 255), font=title_font,
     )
 
     line_h = LEGEND_FONT_SIZE + 4
-    header_y = panel_y0 + 32
+    if habitat_summary:
+        sea = habitat_summary.get("seagrass") or {}
+        oys = habitat_summary.get("oyster") or {}
+        sea_pct = sea.get("pct_of_cell", 0.0) * 100
+        oys_pct = oys.get("pct_of_cell", 0.0) * 100
+        tier = sea.get("tier_counts", {}) or {}
+        sea_msg = (
+            f"seagrass {sea_pct:5.2f}% of cell, "
+            f"{sea.get('candidate_count', 0)} beds "
+            f"(L={tier.get('SEAGRASS_BED_LARGE', 0)} "
+            f"M={tier.get('SEAGRASS_BED_MEDIUM', 0)} "
+            f"S={tier.get('SEAGRASS_BED_SMALL', 0)})"
+        ) if sea else "seagrass: missing"
+        oys_msg = (
+            f"oyster {oys_pct:5.2f}% of cell, "
+            f"{oys.get('candidate_count', 0)} bars"
+        ) if oys else "oyster: missing"
+        legend_draw.text(
+            (10, panel_y0 + 8 + (LEGEND_FONT_SIZE + 4)),
+            f"Habitat: {sea_msg}   |   {oys_msg}",
+            fill=(180, 230, 220, 255), font=legend_font,
+        )
+
+    header_y = panel_y0 + 32 + (LEGEND_FONT_SIZE + 4 if habitat_summary else 0)
     legend_draw.text((10, header_y),
                      "ANCHORS  (primary [secondary count] tertiary count)",
                      fill=(180, 255, 180, 255), font=title_font)
@@ -553,6 +773,15 @@ def run_one(cell_id: str) -> int:
         per_source_counts[source] = len(loaded)
         candidates.extend(loaded)
 
+    # Phase 3a: detect habitat candidates inline (no separate detector script)
+    sea_cands, oys_cands, sea_mask, oys_mask, habitat_summary = (
+        detect_habitat_candidates(cell_id)
+    )
+    per_source_counts["habitat-sea"] = len(sea_cands)
+    per_source_counts["habitat-oys"] = len(oys_cands)
+    candidates.extend(sea_cands)
+    candidates.extend(oys_cands)
+
     print(f"  loaded:  " + "  ".join(f"{s}={n}" for s, n in per_source_counts.items())
           + f"  -> {len(candidates)} total")
 
@@ -580,7 +809,10 @@ def run_one(cell_id: str) -> int:
     overlay_path = out_dir / f"cv_all_{ts}.png"
     json_path = out_dir / f"cv_all_{ts}.json"
 
-    render_combined_overlay(z16_path, anchors, dropped, overlay_path)
+    render_combined_overlay(z16_path, anchors, dropped, overlay_path,
+                            seagrass_mask=sea_mask,
+                            oyster_mask=oys_mask,
+                            habitat_summary=habitat_summary)
 
     # JSON: medium-with-pointers per anchor; full source records in `members`
     def _light_record(c: dict) -> dict:
@@ -599,7 +831,7 @@ def run_one(cell_id: str) -> int:
 
     json_path.write_text(json.dumps({
         "cell_id": cell_id,
-        "phase": 2,
+        "phase": "3a",
         "dedup_distance_px": DEDUP_DISTANCE_PX,
         "secondary_radius_px": SECONDARY_RADIUS_PX,
         "tertiary_radius_px": TERTIARY_RADIUS_PX,
@@ -607,6 +839,7 @@ def run_one(cell_id: str) -> int:
         "kept_count": len(kept),
         "dropped_count": len(dropped),
         "anchor_count": len(anchors),
+        "habitat_summary": habitat_summary,
         "anchors": [
             {
                 "id": a["id"],
