@@ -1,20 +1,46 @@
-"""CV-based drain candidate detection from a binary water mask.
+"""CV-based drain / creek-mouth / large-pocket / shoal candidate detection.
 
-Strategy: morphological opening with a kernel sized to the maximum "throat
-width" we want to consider a drain. Wide water bodies survive the opening;
-narrow connections (drain throats) get erased. Subtracting the opened mask
-from the original gives us the narrow connections — drain throat candidates.
+Operates on the per-cell Google z16 water mask. Finds narrow water strips
+("constrictions") at scale R=25 (catches throats up to ~50 px wide) and
+keeps only those that match one of four rules:
 
-For each candidate region (connected component), emit a bounding box and
-center pixel. The downstream LLM validator (next stage) will receive this
-list with the satellite image and confirm/reject each.
+  DRAIN         — both adjacent wide-water sides are substantial
+                  (side_b >= DRAIN_MIN_SIDE_B_AREA)
+  CREEK_MOUTH   — one big bay, throat >= 40 px, water continues inland
+                  (low inland-water compactness — long thin shape)
+  LARGE_POCKET  — one big bay, throat >= 40 px, dead-end indent
+                  (high inland-water compactness — roundish shape)
+  SHOAL         — one big bay, throat 20-40 px, surrounded by water
+                  (high water density in candidate neighborhood)
 
-Pure numpy + PIL — no scipy/skimage/cv2 required. Iterative 4-connected
-erosion/dilation; slow per pixel but fine for one cell at a time.
+Anything else (small mangrove pockets, interior creek sections, edge artifacts,
+mask noise) is dropped. Edge candidates whose throats sit within EDGE_MARGIN_PX
+of the cell frame are revalidated against the wide z14 mask: if the same
+constriction doesn't reproduce at the wider scale, the candidate was a framing
+artifact and gets dropped. Otherwise it's kept and marked confirmed_at_z14.
+
+The downstream LLM verifier owns the final call on each kept candidate; the
+rules here just keep the input set focused on features likely to be anchors.
+
+Algorithm:
+  1. Smooth the water mask (boundary cleanup).
+  2. wide = open(water, R). narrow = water - wide.
+  3. Connected components on narrow (>= MIN_NARROW_AREA) and wide (>= MIN_WIDE_AREA).
+  4. For each narrow CC: measure throat width, two largest adjacent wide
+     areas, water density in neighborhood, and (for >=40px throats) inland
+     compactness.
+  5. classify() picks one of the four categories or drops the candidate.
+  6. revalidate_edges_at_z14() drops edge artifacts.
+
+Render kept candidates color-coded by category on the satellite.
+
+Input:  data/areas/rookery_bay_v2_google_water/<cell>_water_mask.png
+        data/areas/rookery_bay_v2_google_water/<cell>_wide_z14_styled.png  (optional)
+Output: data/areas/rookery_bay_v2/images/structures/<cell>/cv_drains_<ts>.{png,json}
 
 Usage:
   python scripts/cv_detect_drains.py --cell root-10-8
-  python scripts/cv_detect_drains.py --cell root-2-9 --max-throat-px 20
+  python scripts/cv_detect_drains.py --cell root-2-9 --cell root-11-1 --cell root-11-5
 """
 
 from __future__ import annotations
@@ -28,226 +54,290 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _cv_helpers import (  # noqa: E402
+    EDGE_MARGIN_PX,
+    REPO_ROOT,
+    SMOOTH_RADIUS,
+    bbox_touches_frame,
+    connected_components,
+    find_adjacent,
+    grid_cell_for,
+    load_font,
+    load_z14_water_mask,
+    open_mask,
+    smooth_mask,
+    water_density_around,
+    z16_to_z14,
+)
+
+# ---- Drain-detector parameters ----
+
+SCALE_RADIUS = 25          # captures throats up to ~50 px wide (medium scale)
+MIN_NARROW_AREA = 60       # drop narrow CCs smaller than this (mask-noise floor)
+MIN_WIDE_AREA = 200        # drop wide CCs smaller than this when looking for "sides"
+
+# 4-category classification thresholds (derived from manual classification of
+# root-11-5; revisit on other cells when adding more test data).
+DRAIN_MIN_SIDE_B_AREA = 500       # second-side area required to call a feature a DRAIN
+MOUTH_MIN_SIDE_A_AREA = 5_000     # first-side area required to call ANY single-side feature
+MOUTH_MIN_THROAT_PX = 40          # throat width to qualify as a CREEK MOUTH or LARGE_POCKET
+SHOAL_MIN_THROAT_PX = 20          # lower bound for SHOAL throat (anything below is too small)
+SHOAL_MAX_THROAT_PX = 40          # upper bound (above goes into MOUTH/POCKET category)
+SHOAL_NEIGHBORHOOD_RADIUS = 100   # px radius around the candidate to measure water density
+SHOAL_MIN_WATER_DENSITY = 0.65    # neighborhood >= this fraction water -> SHOAL
+
+# CREEK_MOUTH vs LARGE_POCKET: both have one substantial wide side and a
+# throat >= 40 px. The split is by the SHAPE of the inland water reachable
+# from the throat after subtracting side_a:
+#   - creek mouth: water snakes inland (low compactness — long thin shape)
+#   - large pocket: water fills a roundish bay (high compactness)
+# Threshold tuned on root-11-5 (c15 = 0.302 vs pockets 0.37-0.59).
+CREEK_MOUTH_MAX_INLAND_COMPACTNESS = 0.35
+
+# Edge revalidation against z14
+EDGE_REVALIDATE_MATCH_RADIUS_Z14 = 25   # z14 px (~100 z16 ground px)
+EDGE_REVALIDATE_MIN_NARROW_AREA_Z14 = 6 # min narrow CC pixels at z14 (1/16 area ratio)
 
 
-# ------------------------------------------------------------------
-# Pure-numpy morphology helpers
-# ------------------------------------------------------------------
+# ---- Drain-specific measurements ----
 
 
-def erode_4conn(mask: np.ndarray, iterations: int) -> np.ndarray:
-    """Iteratively erode a boolean mask by 1 pixel per iteration, 4-connected.
+def inland_compactness(smoothed_water: np.ndarray,
+                       narrow_pixels: set[tuple[int, int]],
+                       side_a_pixels: set[tuple[int, int]]) -> float:
+    """Compactness (area / bbox_area) of water reachable from the throat after
+    subtracting side_a's main wide CC.
 
-    A pixel survives erosion only if all 4 cardinal neighbors are also True.
-    Approximates a diamond-shaped structuring element of radius `iterations`.
+    A CREEK MOUTH has water that snakes inland through mangrove (long thin
+    shape -> low compactness). A LARGE POCKET has water that fills a roundish
+    bay (compact shape -> high compactness).
+
+    Returns 0.0 when there's no measurable inland water (the seed pixel is
+    inside side_a). Callers should treat 0.0 as "couldn't measure" rather
+    than "very elongated."
     """
-    m = mask.copy()
-    for _ in range(iterations):
-        # A pixel is True after erosion only if it AND all 4 neighbors were True.
-        # Pad with False so edges erode inward.
-        padded = np.pad(m, 1, constant_values=False)
-        m = (
-            padded[1:-1, 1:-1]
-            & padded[:-2, 1:-1]   # north neighbor
-            & padded[2:, 1:-1]    # south neighbor
-            & padded[1:-1, :-2]   # west neighbor
-            & padded[1:-1, 2:]    # east neighbor
-        )
-    return m
+    h, w = smoothed_water.shape
+    side_a_mask = np.zeros((h, w), dtype=bool)
+    for (y, x) in side_a_pixels:
+        side_a_mask[y, x] = True
+    inland = smoothed_water & ~side_a_mask
 
+    seed_y, seed_x = next(iter(narrow_pixels))
+    if not inland[seed_y, seed_x]:
+        return 0.0
 
-def dilate_4conn(mask: np.ndarray, iterations: int) -> np.ndarray:
-    """Iteratively dilate a boolean mask by 1 pixel per iteration, 4-connected."""
-    m = mask.copy()
-    for _ in range(iterations):
-        padded = np.pad(m, 1, constant_values=False)
-        m = (
-            padded[1:-1, 1:-1]
-            | padded[:-2, 1:-1]
-            | padded[2:, 1:-1]
-            | padded[1:-1, :-2]
-            | padded[1:-1, 2:]
-        )
-    return m
-
-
-def connected_components(mask: np.ndarray, min_pixels: int = 10) -> list[dict]:
-    """Find 4-connected components of a boolean mask. Returns list of dicts:
-        {bbox: (x0, y0, x1, y1), center: (cx, cy), area: int}
-    Filters out components smaller than `min_pixels`.
-    """
-    h, w = mask.shape
-    visited = np.zeros_like(mask, dtype=bool)
-    components: list[dict] = []
-    nbrs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    for y in range(h):
-        for x in range(w):
-            if not mask[y, x] or visited[y, x]:
-                continue
-            # BFS
-            stack = [(y, x)]
-            min_x, min_y, max_x, max_y = x, y, x, y
-            sum_x = sum_y = 0
-            count = 0
-            while stack:
-                yy, xx = stack.pop()
-                if yy < 0 or yy >= h or xx < 0 or xx >= w:
-                    continue
-                if visited[yy, xx] or not mask[yy, xx]:
-                    continue
-                visited[yy, xx] = True
-                count += 1
-                sum_x += xx
-                sum_y += yy
-                if xx < min_x: min_x = xx
-                if xx > max_x: max_x = xx
-                if yy < min_y: min_y = yy
-                if yy > max_y: max_y = yy
-                for dy, dx in nbrs:
-                    stack.append((yy + dy, xx + dx))
-            if count >= min_pixels:
-                components.append({
-                    "bbox": (min_x, min_y, max_x + 1, max_y + 1),
-                    "center": (sum_x / count, sum_y / count),
-                    "area": count,
-                })
-    return components
-
-
-# ------------------------------------------------------------------
-# Drain detection
-# ------------------------------------------------------------------
-
-
-def smooth_mask(mask: np.ndarray, radius: int = 4) -> np.ndarray:
-    """Closing then opening with a small kernel to clean fuzzy mask boundaries.
-
-    Closing (dilate-then-erode) fills small holes; opening (erode-then-dilate)
-    removes small protrusions. Net: smooths the boundary without changing
-    the overall shape much.
-    """
-    closed = erode_4conn(dilate_4conn(mask, radius), radius)
-    opened = dilate_4conn(erode_4conn(closed, radius), radius)
-    return opened
-
-
-def _bbox_dims(bbox: tuple[int, int, int, int]) -> tuple[int, int]:
-    return (bbox[2] - bbox[0], bbox[3] - bbox[1])
-
-
-def _bbox_touches_edge(bbox: tuple[int, int, int, int],
-                       image_size: tuple[int, int],
-                       margin: int = 4) -> bool:
-    w, h = image_size
-    return (bbox[0] <= margin or bbox[1] <= margin
-            or bbox[2] >= w - margin or bbox[3] >= h - margin)
-
-
-def detect_drain_candidates(
-    water_mask: np.ndarray,
-    max_throat_px: int = 25,
-    min_component_px: int = 80,
-    smooth_radius: int = 4,
-    min_elongation: float = 1.5,
-    edge_margin: int = 6,
-) -> list[dict]:
-    """Detect drain throat candidates via morphological opening, with filtering.
-
-    A drain throat is a narrow water connection that disappears when we open
-    the water mask with a kernel sized larger than the throat width.
-
-    Filtering pipeline:
-      1. Pre-smooth the mask to remove boundary noise (closing + opening with
-         small kernel).
-      2. Compute narrow = water - opened(water, max_throat_px / 2).
-      3. Connected-component scan; drop components with area < min_component_px.
-      4. Reject components whose bbox touches the image edge (mostly artifacts
-         where the cell frame cuts a channel).
-      5. Require elongation (max_dim / min_dim >= min_elongation) — drains are
-         throats, not blobs.
-
-    Args:
-      water_mask: HxW boolean array; True = water, False = land.
-      max_throat_px: max width considered a throat. Default 25 = ~25m drains.
-      min_component_px: drop candidates smaller than this. Default 80px.
-      smooth_radius: kernel radius for boundary smoothing. Default 4.
-      min_elongation: max_bbox_dim / min_bbox_dim required. Default 1.5.
-      edge_margin: drop candidates whose bbox touches within this many pixels
-        of the image edge. Default 6.
-
-    Returns: list of candidate dicts (bbox, center, area, elongation).
-    """
-    smoothed = smooth_mask(water_mask, radius=smooth_radius)
-    radius = max(1, max_throat_px // 2)
-    eroded = erode_4conn(smoothed, radius)
-    opened = dilate_4conn(eroded, radius)
-    narrow = smoothed & ~opened
-
-    components = connected_components(narrow, min_pixels=min_component_px)
-    h, w = water_mask.shape
-    filtered: list[dict] = []
-    for c in components:
-        bbox = c["bbox"]
-        if _bbox_touches_edge(bbox, (w, h), margin=edge_margin):
+    visited = np.zeros_like(inland, dtype=bool)
+    stack = [(seed_y, seed_x)]
+    min_x = max_x = seed_x
+    min_y = max_y = seed_y
+    count = 0
+    while stack:
+        yy, xx = stack.pop()
+        if yy < 0 or yy >= h or xx < 0 or xx >= w:
             continue
-        bw, bh = _bbox_dims(bbox)
-        long_dim = max(bw, bh)
-        short_dim = max(1, min(bw, bh))
-        elongation = long_dim / short_dim
-        if elongation < min_elongation:
+        if visited[yy, xx] or not inland[yy, xx]:
             continue
-        c["elongation"] = round(elongation, 2)
-        filtered.append(c)
-    return filtered
+        visited[yy, xx] = True
+        count += 1
+        if xx < min_x: min_x = xx
+        if xx > max_x: max_x = xx
+        if yy < min_y: min_y = yy
+        if yy > max_y: max_y = yy
+        stack.extend([(yy - 1, xx), (yy + 1, xx), (yy, xx - 1), (yy, xx + 1)])
+
+    bbox_area = (max_x - min_x + 1) * (max_y - min_y + 1)
+    return count / max(1, bbox_area)
 
 
-# ------------------------------------------------------------------
-# Visualization
-# ------------------------------------------------------------------
+# ---- Classification ----
 
 
-def _grid_cell_for(px: float, py: float,
-                   image_size: tuple[int, int] = (1280, 1280),
-                   rows: int = 8, cols: int = 8) -> str:
-    """Return the A1-H8 cell label for a pixel position."""
-    w, h = image_size
-    col = max(0, min(cols - 1, int(px / (w / cols))))
-    row = max(0, min(rows - 1, int(py / (h / rows))))
-    return f"{chr(ord('A') + row)}{col + 1}"
-
-
-def _load_font(size: int):
-    from PIL import ImageFont
-    for name in ("arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
-        try:
-            return ImageFont.truetype(name, size)
-        except (OSError, IOError):
-            continue
-    return ImageFont.load_default()
-
-
-def render_candidates_overlay(
-    base_image_path: Path,
-    candidates: list[dict],
-    output_path: Path,
-    image_size: tuple[int, int] = (1280, 1280),
-) -> Path:
-    """Draw 8x8 A1-H8 grid + candidate boxes/centers/labels on the base image.
-
-    Each candidate gets:
-      - red bbox + center dot
-      - label "dN @ <cell>" (the grid cell containing the center)
+def classify(c: dict) -> str | None:
+    """Apply the 4-category filter. Returns one of:
+      DRAIN, CREEK_MOUTH, LARGE_POCKET, SHOAL
+    or None if the candidate doesn't fit any kept category.
     """
+    side_a = c["side_a_area_px"]
+    side_b = c["side_b_area_px"]
+    throat = c["throat_width_px"]
+    density = c["water_density"]
+    compactness = c.get("inland_compactness", 0.0)
+
+    if side_b >= DRAIN_MIN_SIDE_B_AREA:
+        return "DRAIN"
+    if side_a < MOUTH_MIN_SIDE_A_AREA:
+        return None
+    # one-side-substantial cases
+    if throat >= MOUTH_MIN_THROAT_PX:
+        if compactness < CREEK_MOUTH_MAX_INLAND_COMPACTNESS:
+            return "CREEK_MOUTH"
+        return "LARGE_POCKET"
+    if SHOAL_MIN_THROAT_PX <= throat < MOUTH_MIN_THROAT_PX:
+        if density >= SHOAL_MIN_WATER_DENSITY:
+            return "SHOAL"
+    return None
+
+
+# ---- Detection ----
+
+
+def detect_constrictions(water: np.ndarray) -> tuple[list[dict], np.ndarray]:
+    """Single-scale detection at SCALE_RADIUS. Returns (kept_candidates, wide_mask).
+
+    Each kept candidate dict carries: bbox, center, narrow_area_px,
+    throat_width_px, side_a_area_px, side_b_area_px, n_adjacent_wides,
+    water_density, inland_compactness, scale_radius_px, is_edge_truncated,
+    category.
+    """
+    smoothed = smooth_mask(water, radius=SMOOTH_RADIUS)
+    wide = open_mask(smoothed, SCALE_RADIUS)
+    narrow = smoothed & ~wide
+
+    narrow_ccs = connected_components(narrow, min_pixels=MIN_NARROW_AREA)
+    wide_ccs = connected_components(wide, min_pixels=MIN_WIDE_AREA)
+
+    kept: list[dict] = []
+    for nc in narrow_ccs:
+        bbox = nc["bbox"]
+        bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        throat_width = min(bw, bh)
+
+        adj = find_adjacent(nc["pixels"], wide_ccs, water.shape)
+        adj.sort(key=lambda c: c["area"], reverse=True)
+        side_a_cc = adj[0] if len(adj) >= 1 else None
+        side_a = side_a_cc["area"] if side_a_cc else 0
+        side_b = adj[1]["area"] if len(adj) >= 2 else 0
+
+        density = water_density_around(smoothed, nc["center"], SHOAL_NEIGHBORHOOD_RADIUS)
+
+        # Compactness only matters for the >=40px creek/pocket split.
+        if (side_a_cc is not None
+                and throat_width >= MOUTH_MIN_THROAT_PX
+                and side_b < DRAIN_MIN_SIDE_B_AREA):
+            compactness = inland_compactness(smoothed, nc["pixels"], side_a_cc["pixels"])
+        else:
+            compactness = 0.0
+
+        cand = {
+            "bbox": bbox,
+            "center": nc["center"],
+            "narrow_area_px": nc["area"],
+            "throat_width_px": throat_width,
+            "side_a_area_px": side_a,
+            "side_b_area_px": side_b,
+            "n_adjacent_wides": len(adj),
+            "water_density": round(density, 3),
+            "inland_compactness": round(compactness, 3),
+            "scale_radius_px": SCALE_RADIUS,
+            "is_edge_truncated": bbox_touches_frame(bbox, water.shape, EDGE_MARGIN_PX),
+        }
+        cat = classify(cand)
+        if cat is None:
+            continue
+        cand["category"] = cat
+        kept.append(cand)
+
+    return kept, wide
+
+
+# ---- Edge revalidation against z14 ----
+
+
+def revalidate_edges_at_z14(candidates: list[dict], cell_id: str) -> tuple[int, int, int]:
+    """For each is_edge_truncated candidate, re-run the wide/narrow split on
+    the wider z14 mask and DROP those that don't have a matching narrow CC
+    near the edge candidate's z14-mapped location.
+
+    Insight: most z16 edge "features" aren't really features — they're
+    artifacts of the cell boundary cutting through what's really open water,
+    a continuous shoreline, or a mangrove edge. When the wider context is
+    visible at z14, those artifacts disappear. The ones that survive are
+    real features whose throat happens to fall near the cell border.
+
+    Augments surviving candidates with confirmed_at_z14: True.
+
+    Returns (n_edge_input, n_confirmed, n_dropped). No-op if the wide z14
+    styled image isn't on disk.
+    """
+    edge_indices = [i for i, c in enumerate(candidates) if c.get("is_edge_truncated")]
+    if not edge_indices:
+        return (0, 0, 0)
+
+    z14_water = load_z14_water_mask(cell_id)
+    if z14_water is None:
+        print(f"  no z14 wide tile for {cell_id} — skipping edge revalidation")
+        return (0, 0, 0)
+
+    # Same wide/narrow split at z14 with R scaled to match z16 ground scale
+    # (1 z14 pixel = 4 z16 ground pixels, so z14_R = z16_R / 4).
+    smoothed_z14 = smooth_mask(z14_water, radius=SMOOTH_RADIUS)
+    z14_R = max(1, SCALE_RADIUS // 4)            # = 6
+    wide_z14 = open_mask(smoothed_z14, z14_R)
+    narrow_z14 = smoothed_z14 & ~wide_z14
+    z14_narrow_ccs = connected_components(
+        narrow_z14, min_pixels=EDGE_REVALIDATE_MIN_NARROW_AREA_Z14,
+    )
+
+    drop_indices: list[int] = []
+    n_confirmed = 0
+    match_dist_sq = EDGE_REVALIDATE_MATCH_RADIUS_Z14 ** 2
+
+    for i in edge_indices:
+        c = candidates[i]
+        z14_cx, z14_cy = z16_to_z14(c["center"][0], c["center"][1])
+        matched = False
+        for nc in z14_narrow_ccs:
+            ncx, ncy = nc["center"]
+            d_sq = (ncx - z14_cx) ** 2 + (ncy - z14_cy) ** 2
+            if d_sq < match_dist_sq:
+                matched = True
+                break
+        if matched:
+            c["confirmed_at_z14"] = True
+            n_confirmed += 1
+        else:
+            drop_indices.append(i)
+
+    for i in sorted(drop_indices, reverse=True):
+        candidates.pop(i)
+
+    return (len(edge_indices), n_confirmed, len(drop_indices))
+
+
+# ---- Rendering ----
+
+
+CATEGORY_COLOR = {
+    "DRAIN":        (220,  30,  30, 255),    # red
+    "CREEK_MOUTH":  (255, 165,   0, 255),    # orange — rare, true creek extending inland
+    "LARGE_POCKET": (255, 230,  50, 255),    # yellow — common, dead-end indent
+    "SHOAL":        ( 60, 200, 230, 255),    # cyan-ish — open-water constriction
+}
+WIDE_TINT = (80, 170, 220, 60)
+
+
+def render_overlay(base_image_path: Path,
+                   candidates: list[dict],
+                   wide_mask: np.ndarray,
+                   output_path: Path,
+                   image_size: tuple[int, int] = (1280, 1280)) -> Path:
     base = Image.open(base_image_path).convert("RGBA")
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+
+    # Tint wide-water bodies for context.
+    h, w = wide_mask.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[wide_mask] = WIDE_TINT
+    wide_layer = Image.fromarray(rgba, mode="RGBA")
+    layer = Image.alpha_composite(layer, wide_layer)
     draw = ImageDraw.Draw(layer, "RGBA")
 
-    # 8x8 A1-H8 grid (same style as ensure_grid_overlay)
+    # 8x8 A1-H8 grid
     rows, cols = 8, 8
     gw, gh = image_size
-    cell_w = gw / cols
-    cell_h = gh / rows
+    cell_w, cell_h = gw / cols, gh / rows
     for i in range(1, cols):
         x = int(i * cell_w)
         draw.line([(x + 1, 0), (x + 1, gh)], fill=(0, 0, 0, 200), width=1)
@@ -256,13 +346,13 @@ def render_candidates_overlay(
         y = int(j * cell_h)
         draw.line([(0, y + 1), (gw, y + 1)], fill=(0, 0, 0, 200), width=1)
         draw.line([(0, y), (gw, y)], fill=(255, 255, 255, 230), width=2)
-    grid_font = _load_font(max(10, int(min(cell_w, cell_h) * 0.30)))
+    grid_font = load_font(max(10, int(min(cell_w, cell_h) * 0.30)))
     for r in range(rows):
         for c in range(cols):
-            label = f"{chr(ord('A') + r)}{c + 1}"
+            text = f"{chr(ord('A') + r)}{c + 1}"
             cx = int((c + 0.5) * cell_w)
             cy = int((r + 0.5) * cell_h)
-            bbox_t = grid_font.getbbox(label)
+            bbox_t = grid_font.getbbox(text)
             tw = bbox_t[2] - bbox_t[0]
             th = bbox_t[3] - bbox_t[1]
             tx = cx - tw // 2
@@ -270,61 +360,81 @@ def render_candidates_overlay(
             for dx in (-1, 0, 1):
                 for dy in (-1, 0, 1):
                     if dx or dy:
-                        draw.text((tx + dx, ty + dy), label, fill="black", font=grid_font)
-            draw.text((tx, ty), label, fill="white", font=grid_font)
+                        draw.text((tx + dx, ty + dy), text, fill="black", font=grid_font)
+            draw.text((tx, ty), text, fill="white", font=grid_font)
 
-    # Candidate markings on top of the grid
-    label_font = _load_font(20)
-    for i, c in enumerate(candidates, start=1):
-        bbox = c["bbox"]
-        cx, cy = c["center"]
-        cell = _grid_cell_for(cx, cy, image_size)
+    label_font = load_font(15)
+    for i, cand in enumerate(candidates, start=1):
+        bbox = cand["bbox"]
+        cx, cy = cand["center"]
+        cell = grid_cell_for(cx, cy, image_size)
+        color = CATEGORY_COLOR.get(cand["category"], (200, 200, 200, 255))
         x0 = max(0, bbox[0] - 4)
         y0 = max(0, bbox[1] - 4)
-        x1 = min(base.size[0], bbox[2] + 4)
-        y1 = min(base.size[1], bbox[3] + 4)
-        draw.rectangle([x0, y0, x1, y1], outline=(255, 60, 60, 255), width=3)
-        r = 9
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
-                     fill=(255, 60, 60, 255), outline=(255, 255, 255, 255), width=2)
-        # Label with id + cell + area, with a black halo for legibility over imagery
-        text = f"d{i} @ {cell}  ({c['area']}px)"
-        tx = max(2, min(image_size[0] - 220, int(cx) + 12))
-        ty = max(2, min(image_size[1] - 24, int(cy) - 22))
+        x1 = min(image_size[0], bbox[2] + 4)
+        y1 = min(image_size[1], bbox[3] + 4)
+        is_edge = cand.get("is_edge_truncated", False)
+        if is_edge:
+            for seg_x in range(x0, x1, 12):
+                draw.line([(seg_x, y0), (min(seg_x + 6, x1), y0)], fill=color, width=3)
+                draw.line([(seg_x, y1), (min(seg_x + 6, x1), y1)], fill=color, width=3)
+            for seg_y in range(y0, y1, 12):
+                draw.line([(x0, seg_y), (x0, min(seg_y + 6, y1))], fill=color, width=3)
+                draw.line([(x1, seg_y), (x1, min(seg_y + 6, y1))], fill=color, width=3)
+        else:
+            draw.rectangle([x0, y0, x1, y1], outline=color, width=3)
+        r = 7
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=color,
+                     outline=(255, 255, 255, 255), width=2)
+        edge_tag = "[E] " if is_edge else ""
+        text = (f"c{i} {edge_tag}{cand['category']} @{cell}  thr={cand['throat_width_px']}px  "
+                f"A={cand['side_a_area_px']}  B={cand['side_b_area_px']}")
+        tx = max(2, min(image_size[0] - 440, int(cx) + 12))
+        ty = max(2, min(image_size[1] - 22, int(cy) - 20))
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 if dx or dy:
                     draw.text((tx + dx, ty + dy), text, fill="black", font=label_font)
-        draw.text((tx, ty), text, fill=(255, 255, 255, 255), font=label_font)
+        draw.text((tx, ty), text, fill=color, font=label_font)
+
+    # Legend (top-right) with one row per category + edge-truncated note
+    legend_rows = [
+        ("DRAIN",        CATEGORY_COLOR["DRAIN"],        "both sides have substantial water"),
+        ("CREEK_MOUTH",  CATEGORY_COLOR["CREEK_MOUTH"],  "throat >= 40, water continues inland (low compactness)"),
+        ("LARGE_POCKET", CATEGORY_COLOR["LARGE_POCKET"], "throat >= 40, dead-end indent (high compactness)"),
+        ("SHOAL",        CATEGORY_COLOR["SHOAL"],        "open-water constriction (20-40 px)"),
+    ]
+    extra_note = "Dashed box + [E] tag = is_edge_truncated (LLM verifier should re-judge)"
+    line_h = 22
+    box_w = 540
+    box_h = line_h * (len(legend_rows) + 2) + 14
+    bx0 = image_size[0] - box_w - 8
+    by0 = 8
+    draw.rectangle([bx0, by0, bx0 + box_w, by0 + box_h],
+                   fill=(0, 0, 0, 210), outline=(255, 255, 255, 255), width=2)
+    draw.text((bx0 + 8, by0 + 6),
+              f"Drains  (R={SCALE_RADIUS}, kept categories only)",
+              fill=(255, 255, 255, 255), font=label_font)
+    ty = by0 + 6 + line_h
+    for label, color, descr in legend_rows:
+        sx = bx0 + 8
+        draw.rectangle([sx, ty + 3, sx + 18, ty + 19], fill=color)
+        draw.text((sx + 26, ty), f"{label}  —  {descr}",
+                  fill=(255, 255, 255, 255), font=label_font)
+        ty += line_h
+    draw.text((bx0 + 8, ty), extra_note,
+              fill=(220, 220, 220, 255), font=label_font)
 
     Image.alpha_composite(base, layer).convert("RGB").save(output_path)
     return output_path
 
 
-# ------------------------------------------------------------------
-# Main
-# ------------------------------------------------------------------
+# ---- CLI ----
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cell", required=True, help="cell_id like root-10-8")
-    parser.add_argument("--max-throat-px", type=int, default=25,
-                        help="Max throat width in px to flag (~m at z16). Default 25.")
-    parser.add_argument("--min-component-px", type=int, default=80,
-                        help="Drop candidates smaller than this (pixels). Default 80.")
-    parser.add_argument("--smooth-radius", type=int, default=4,
-                        help="Kernel radius for boundary smoothing. Default 4.")
-    parser.add_argument("--min-elongation", type=float, default=1.5,
-                        help="Required max_dim/min_dim ratio. Default 1.5.")
-    parser.add_argument("--edge-margin", type=int, default=6,
-                        help="Drop candidates within N px of image edge. Default 6.")
-    args = parser.parse_args()
-
-    cell_id = args.cell
+def run_one(cell_id: str) -> int:
     parent_num, child_num = cell_id.removeprefix("root-").split("-")
     stem = f"z0_{parent_num}_{child_num}"
-
     water_mask_path = (REPO_ROOT / "data" / "areas" / "rookery_bay_v2_google_water"
                        / f"{cell_id}_water_mask.png")
     z16_path = (REPO_ROOT / "data" / "areas" / "rookery_bay_v2" / "images"
@@ -333,67 +443,95 @@ def main() -> int:
                / "structures" / cell_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not water_mask_path.exists():
-        print(f"missing water mask: {water_mask_path}", file=sys.stderr)
-        return 2
-    if not z16_path.exists():
-        print(f"missing z16 image: {z16_path}", file=sys.stderr)
-        return 2
+    if not water_mask_path.exists() or not z16_path.exists():
+        print(f"{cell_id}: missing inputs. Skipping.")
+        return 1
 
-    print(f"loading water mask: {water_mask_path.name}")
+    print(f"--- {cell_id} ---")
     mask_img = Image.open(water_mask_path).convert("L")
     if mask_img.size != (1280, 1280):
-        print(f"resizing mask {mask_img.size} -> (1280, 1280)")
         mask_img = mask_img.resize((1280, 1280), Image.NEAREST)
     water = np.array(mask_img) > 127
 
-    print(f"detecting candidates (max_throat={args.max_throat_px}px, "
-          f"smooth={args.smooth_radius}, min_area={args.min_component_px}, "
-          f"min_elong={args.min_elongation})...")
-    candidates = detect_drain_candidates(
-        water,
-        max_throat_px=args.max_throat_px,
-        min_component_px=args.min_component_px,
-        smooth_radius=args.smooth_radius,
-        min_elongation=args.min_elongation,
-        edge_margin=args.edge_margin,
-    )
-    print(f"detected {len(candidates)} drain throat candidates")
+    print(f"detecting constrictions (R={SCALE_RADIUS})...")
+    candidates, wide_mask = detect_constrictions(water)
+    edge_count = sum(1 for c in candidates if c.get("is_edge_truncated"))
+    print(f"  {len(candidates)} initial kept; {edge_count} edge-truncated")
+
+    if edge_count:
+        print(f"  revalidating edge candidates against wide z14 view...")
+        n_in, n_ok, n_drop = revalidate_edges_at_z14(candidates, cell_id)
+        print(f"  z14 revalidation: {n_in} edge candidates checked, "
+              f"{n_ok} confirmed, {n_drop} dropped (no z14 constriction)")
+
+    counts: dict[str, int] = {}
+    for c in candidates:
+        counts[c["category"]] = counts.get(c["category"], 0) + 1
+    print(f"  {len(candidates)} final kept: "
+          f"DRAIN={counts.get('DRAIN', 0)}  "
+          f"CREEK_MOUTH={counts.get('CREEK_MOUTH', 0)}  "
+          f"LARGE_POCKET={counts.get('LARGE_POCKET', 0)}  "
+          f"SHOAL={counts.get('SHOAL', 0)}")
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    overlay_path = out_dir / f"cv_drain_candidates_{ts}.png"
-    json_path = out_dir / f"cv_drain_candidates_{ts}.json"
-    render_candidates_overlay(z16_path, candidates, overlay_path)
+    overlay_path = out_dir / f"cv_drains_{ts}.png"
+    json_path = out_dir / f"cv_drains_{ts}.json"
+
+    render_overlay(z16_path, candidates, wide_mask, overlay_path)
     json_path.write_text(json.dumps({
         "cell_id": cell_id,
-        "max_throat_px": args.max_throat_px,
-        "min_component_px": args.min_component_px,
+        "detector": "cv_detect_drains",
+        "scale_radius_px": SCALE_RADIUS,
         "candidates": [
             {
-                "candidate_id": f"d{i}",
+                "id": f"c{i}",
+                "category": c["category"],
+                "is_edge_truncated": c.get("is_edge_truncated", False),
+                "confirmed_at_z14": c.get("confirmed_at_z14", False),
                 "pixel_bbox": list(c["bbox"]),
                 "pixel_center": [round(c["center"][0], 1), round(c["center"][1], 1)],
-                "area_px": c["area"],
+                "throat_width_px": c["throat_width_px"],
+                "narrow_area_px": c["narrow_area_px"],
+                "side_a_area_px": c["side_a_area_px"],
+                "side_b_area_px": c["side_b_area_px"],
+                "n_adjacent_wides": c["n_adjacent_wides"],
+                "water_density": c["water_density"],
+                "inland_compactness": c["inland_compactness"],
+                "scale_radius_px": c.get("scale_radius_px", SCALE_RADIUS),
             }
             for i, c in enumerate(candidates, start=1)
         ],
     }, indent=2), encoding="utf-8")
 
-    print()
-    print(f"=== {cell_id} drain candidates ===")
-    print(f"  {'id':<4s} {'cell':<4s} {'center':<14s} {'bbox':<24s} {'area':>6s} {'elong':>5s}")
-    for i, c in enumerate(candidates, start=1):
-        bbox = c["bbox"]
-        cx, cy = c["center"]
-        cell = _grid_cell_for(cx, cy)
-        elong = c.get("elongation", 0.0)
-        print(f"  d{i:<3d} {cell:<4s} ({cx:>4.0f},{cy:>4.0f})  "
-              f"({bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]})  "
-              f"{c['area']:>5d}  {elong:>5.2f}")
-    print()
-    print(f"overlay: {overlay_path.relative_to(REPO_ROOT)}")
-    print(f"json:    {json_path.relative_to(REPO_ROOT)}")
+    if candidates:
+        print(f"\n  {'id':<5s} {'cat':<13s} {'cell':<4s} {'edge':>5s} "
+              f"{'throat':>6s} {'A_area':>9s} {'B_area':>9s} {'wdens':>5s} {'compact':>7s}")
+        for i, c in enumerate(candidates, start=1):
+            cell = grid_cell_for(c["center"][0], c["center"][1])
+            if c.get("is_edge_truncated"):
+                edge_flag = "E*" if c.get("confirmed_at_z14") else "E?"
+            else:
+                edge_flag = "  "
+            print(f"  c{i:<4d} {c['category']:<13s} {cell:<4s} {edge_flag:>5s} "
+                  f"{c['throat_width_px']:>4d}px "
+                  f"{c['side_a_area_px']:>9d} {c['side_b_area_px']:>9d} "
+                  f"{c['water_density']:>5.2f} {c['inland_compactness']:>7.3f}")
+    print(f"\n  overlay: {overlay_path.relative_to(REPO_ROOT)}")
+    print(f"  json:    {json_path.relative_to(REPO_ROOT)}")
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cell", action="append", required=True,
+                        help="Cell id like root-10-8. Repeat for multiple.")
+    args = parser.parse_args()
+    rc_overall = 0
+    for cell_id in args.cell:
+        rc = run_one(cell_id)
+        if rc != 0:
+            rc_overall = rc
+    return rc_overall
 
 
 if __name__ == "__main__":
