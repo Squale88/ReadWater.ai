@@ -1,19 +1,12 @@
-"""Shared building blocks for CV-based feature detectors.
+"""Shared building blocks for the CV pipeline.
 
-All scripts that operate on the per-cell water mask share the same
-morphology, connected-component, adjacency, and z16<->z14 plumbing. Pulling
-those into one module keeps each detector script focused on the category
-logic specific to its feature type.
+Pure-numpy primitives (4-connected morphology, BFS connected components,
+adjacency, density), z16<->z14 coordinate mapping, edge detection, and
+mask-loading helpers. No detector logic lives here — every detector pulls
+what it needs and adds its own classify() / render() / CLI.
 
-Used by:
-  - cv_detect_drains.py    (DRAIN / CREEK_MOUTH / LARGE_POCKET / SHOAL)
-  - cv_detect_islands.py   (ISLAND_SMALL / _MEDIUM / _LARGE)
-  - cv_detect_points.py    (POINT)
-  - cv_detect_cuts.py      (CUT)
-  - cv_detect_all.py       (orchestrator)
-
-No detector logic lives here — only generic primitives. Each detector
-imports what it needs and adds its own classify() / render_overlay() / CLI.
+Path-touching helpers take ``area_id`` so this module is area-agnostic.
+All path construction goes through ``readwater.storage``.
 """
 
 from __future__ import annotations
@@ -23,36 +16,83 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageFont
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+from readwater import storage
 
 # ---- Shared constants ----
 
-EDGE_MARGIN_PX = 6         # bbox within this many pixels of the frame -> is_edge_truncated
-SMOOTH_RADIUS = 4          # boundary smoothing kernel applied to every mask
-GOOGLE_WATER_DIR = REPO_ROOT / "data" / "areas" / "rookery_bay_v2_google_water"
-HABITAT_DIR = REPO_ROOT / "data" / "areas" / "rookery_bay_v2_habitats"
+EDGE_MARGIN_PX = 6     # bbox within this many pixels of the frame -> is_edge_truncated
+SMOOTH_RADIUS = 4      # boundary smoothing kernel applied to every mask
 
 
-# ---- Habitat mask loading ----
+# ---- Mask loading ----
 
 
-def load_habitat_mask(cell_id: str, kind: str,
-                      image_size: tuple[int, int] = (1280, 1280)
-                      ) -> np.ndarray | None:
-    """Load an FWC habitat mask for a cell as a boolean array.
+def load_water_mask(area_id: str, cell_id: str,
+                    image_size: tuple[int, int] = (1280, 1280)
+                    ) -> np.ndarray | None:
+    """Load the per-cell z16 water mask as a boolean array.
 
-    `kind` is "seagrass" or "oyster". The on-disk file lives at
-    ``data/areas/rookery_bay_v2_habitats/<cell>_<kind>_mask.png``
-    and is a single-channel 8-bit PNG with 0 = absent, 255 = present.
-    Returns None if the file isn't on disk.
+    Returns ``None`` if the mask isn't on disk. The mask is a single-channel
+    8-bit PNG with 0 = land, >127 = water.
     """
-    p = HABITAT_DIR / f"{cell_id}_{kind}_mask.png"
+    p = storage.water_mask_path(area_id, cell_id)
     if not p.exists():
         return None
     img = Image.open(p).convert("L")
     if img.size != image_size:
         img = img.resize(image_size, Image.NEAREST)
     return np.array(img) > 127
+
+
+def load_habitat_mask(area_id: str, cell_id: str, kind: str,
+                      image_size: tuple[int, int] = (1280, 1280)
+                      ) -> np.ndarray | None:
+    """Load an FWC habitat mask. ``kind`` is "seagrass" or "oyster".
+    Returns ``None`` if the file isn't on disk.
+    """
+    if kind == "seagrass":
+        p = storage.seagrass_mask_path(area_id, cell_id)
+    elif kind == "oyster":
+        p = storage.oyster_mask_path(area_id, cell_id)
+    else:
+        raise ValueError(f"unknown habitat kind: {kind!r}")
+    if not p.exists():
+        return None
+    img = Image.open(p).convert("L")
+    if img.size != image_size:
+        img = img.resize(image_size, Image.NEAREST)
+    return np.array(img) > 127
+
+
+def load_z14_water_mask(area_id: str, cell_id: str) -> np.ndarray | None:
+    """Load and threshold the wide z14 styled tile for a cell.
+
+    Returns a 1280x1280 boolean array (True = water) or None if the file
+    isn't on disk. The styled tile was produced by the water_mask pipeline
+    when run with --wide.
+    """
+    z14_styled = storage.water_z14_wide_styled_path(area_id, cell_id)
+    if not z14_styled.exists():
+        return None
+    mask = water_mask_from_styled_png(z14_styled)
+    if mask.shape != (1280, 1280):
+        img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+        img = img.resize((1280, 1280), Image.NEAREST)
+        mask = np.array(img) > 127
+    return mask
+
+
+def water_mask_from_styled_png(styled_png: Path) -> np.ndarray:
+    """Threshold a styled water tile (water=blue, land=white) into a boolean
+    mask. Mirrors ``readwater.pipeline.cv.water_mask:water_mask_from_styled``
+    but stays callable on any PNG path.
+    """
+    img = Image.open(styled_png).convert("RGB")
+    arr = np.array(img)
+    r = arr[:, :, 0].astype(np.int16)
+    g = arr[:, :, 1].astype(np.int16)
+    b = arr[:, :, 2].astype(np.int16)
+    return (b > 128) & (r < 96) & (g < 96)
 
 
 # ---- Pure-numpy 4-connected morphology ----
@@ -158,7 +198,7 @@ def find_adjacent(seed_pixels: set[tuple[int, int]],
     return adjacent
 
 
-# ---- Density measurement (used by drains for SHOAL test, also useful elsewhere) ----
+# ---- Density measurement ----
 
 
 def water_density_around(water: np.ndarray,
@@ -202,40 +242,6 @@ def z16_to_z14(z16_x: float, z16_y: float) -> tuple[float, float]:
     the central 320x320 region of the z14 image (pixels 480..800 in each axis).
     """
     return (480.0 + z16_x / 4.0, 480.0 + z16_y / 4.0)
-
-
-# ---- Z14 mask loading ----
-
-
-def water_mask_from_styled_png(styled_png: Path) -> np.ndarray:
-    """Threshold a styled water tile (water=blue, land=white) into a binary
-    boolean mask. Mirrors scripts/google_water_mask.py:water_mask_from_styled.
-    """
-    img = Image.open(styled_png).convert("RGB")
-    arr = np.array(img)
-    r = arr[:, :, 0].astype(np.int16)
-    g = arr[:, :, 1].astype(np.int16)
-    b = arr[:, :, 2].astype(np.int16)
-    return (b > 128) & (r < 96) & (g < 96)
-
-
-def load_z14_water_mask(cell_id: str) -> np.ndarray | None:
-    """Load and threshold the wide z14 styled tile for a cell.
-
-    Returns a 1280x1280 boolean array (True = water) or None if the file
-    isn't on disk. The styled tile lives next to the z16 mask under
-    ``data/areas/rookery_bay_v2_google_water/<cell>_wide_z14_styled.png``
-    and was produced by ``scripts/google_water_mask.py --wide``.
-    """
-    z14_styled = GOOGLE_WATER_DIR / f"{cell_id}_wide_z14_styled.png"
-    if not z14_styled.exists():
-        return None
-    mask = water_mask_from_styled_png(z14_styled)
-    if mask.shape != (1280, 1280):
-        img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
-        img = img.resize((1280, 1280), Image.NEAREST)
-        mask = np.array(img) > 127
-    return mask
 
 
 # ---- Grid-cell labels (8x8 A1-H8) ----

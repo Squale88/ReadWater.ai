@@ -45,6 +45,42 @@ from readwater.areas import MANIFEST_SCHEMA_VERSION  # noqa: E402
 
 Z16_PATTERN = re.compile(r"^z0_(\d+)_(\d+)\.png$")
 
+# How many sub-cells per side a parent z14 cell is divided into. Matches
+# _SECTIONS in scripts/_cells.py and the discovery pipeline's grid math.
+_SUB_GRID_SIZE = 4
+
+
+def _load_parent_bboxes(area_id: str) -> dict[str, dict]:
+    """Read parent z14 bboxes from data/areas/<area>/images/metadata.json.
+
+    metadata.json is the discovery pipeline's manifest; it contains one
+    entry per discovered cell including depth-1 parents. We only need
+    parents to derive sub-cell centers via grid math.
+    """
+    md_path = storage.area_root(area_id) / "images" / "metadata.json"
+    if not md_path.exists():
+        return {}
+    entries = json.loads(md_path.read_text(encoding="utf-8"))
+    parents: dict[str, dict] = {}
+    for e in entries:
+        if e.get("depth") == 1 and isinstance(e.get("bbox"), dict):
+            parents[e["cell_id"]] = e["bbox"]
+    return parents
+
+
+def _sub_cell_center(parent_bbox: dict, cell_num: int) -> tuple[float, float]:
+    """Compute (lat, lon) of a 1-indexed sub-cell within its parent bbox.
+
+    Mirrors _sub_cell_center in scripts/_cells.py (which is being deprecated).
+    """
+    row = (cell_num - 1) // _SUB_GRID_SIZE
+    col = (cell_num - 1) % _SUB_GRID_SIZE
+    cell_h = (parent_bbox["north"] - parent_bbox["south"]) / _SUB_GRID_SIZE
+    cell_w = (parent_bbox["east"] - parent_bbox["west"]) / _SUB_GRID_SIZE
+    lat = parent_bbox["north"] - (row + 0.5) * cell_h
+    lon = parent_bbox["west"] + (col + 0.5) * cell_w
+    return (round(lat, 6), round(lon, 6))
+
 
 def _discover_cell_ids(area_id: str) -> list[str]:
     """Return all z16 cell ids in the area, by scanning the images dir.
@@ -83,9 +119,25 @@ def _maybe_record(entry: dict, key: str, path: Path) -> None:
         entry[key] = storage.relative_to_data_root(path)
 
 
-def _build_cell_entry(area_id: str, cell_id: str) -> dict:
-    """Inspect on-disk artifacts for one cell and produce its manifest entry."""
+def _build_cell_entry(area_id: str, cell_id: str,
+                      parent_bboxes: dict[str, dict]) -> dict:
+    """Inspect on-disk artifacts for one cell and produce its manifest entry.
+
+    Adds geo metadata (parent + cell_num + center) so callers don't have to
+    reach into ``scripts/_cells.py`` (legacy fixture being deprecated).
+    """
     entry: dict = {}
+
+    # Geo metadata derived from cell_id + parent bbox
+    parent_num, child_num = cell_id.removeprefix("root-").split("-")
+    parent_id = f"root-{parent_num}"
+    cell_num = int(child_num)
+    entry["parent"] = parent_id
+    entry["cell_num"] = cell_num
+    parent_bbox = parent_bboxes.get(parent_id)
+    if parent_bbox is not None:
+        lat, lon = _sub_cell_center(parent_bbox, cell_num)
+        entry["center"] = [lat, lon]
 
     # Discovery outputs
     _maybe_record(entry, "z16_image", storage.z16_image_path(area_id, cell_id))
@@ -134,13 +186,17 @@ def _build_cell_entry(area_id: str, cell_id: str) -> dict:
 
 
 def build_manifest(area_id: str) -> dict:
+    parent_bboxes = _load_parent_bboxes(area_id)
     cell_ids = _discover_cell_ids(area_id)
     cells: dict[str, dict] = {}
     for cid in cell_ids:
-        cells[cid] = _build_cell_entry(area_id, cid)
+        cells[cid] = _build_cell_entry(area_id, cid, parent_bboxes)
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "area_id": area_id,
+        "parents": {
+            pid: {"bbox": bbox} for pid, bbox in sorted(parent_bboxes.items())
+        },
         "cells": cells,
     }
 

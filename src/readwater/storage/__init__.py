@@ -27,18 +27,15 @@ Path conventions (current, on-disk):
   Per-cell anchor JSON:
       area_root() / "images" / "structures" / <cell_id> / "cv_all_<ts>.json"
 
-Mask paths (transitional — will move under area_root() in PR 2):
-
-  Water mask:   data_root() / "areas" / "<area>_google_water" / "<cell>_water_mask.png"
-  Z14 wide:     data_root() / "areas" / "<area>_google_water" / "<cell>_wide_z14_styled.png"
-  Seagrass:     data_root() / "areas" / "<area>_habitats"     / "<cell>_seagrass_mask.png"
-  Oyster:       data_root() / "areas" / "<area>_habitats"     / "<cell>_oyster_mask.png"
-
-After PR 2 these consolidate to:
+Mask paths (consolidated under area_root() as of PR 2):
 
   Water mask:   area_root() / "masks" / "water"    / "<cell>_water_mask.png"
+  Z14 wide:     area_root() / "masks" / "water"    / "<cell>_wide_z14_styled.png"
   Seagrass:     area_root() / "masks" / "seagrass" / "<cell>_seagrass_mask.png"
-  ...
+  Oyster:       area_root() / "masks" / "oyster"   / "<cell>_oyster_mask.png"
+
+Shared/cached habitat geojson lives at area_root() / "masks" / and is
+keyed by habitat kind (oyster_beds.geojson, seagrass.geojson).
 """
 
 from __future__ import annotations
@@ -82,40 +79,62 @@ def area_manifest_path(area_id: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Mask paths (transitional sibling-dir layout — see module docstring)
+# Mask paths (consolidated under area_root() as of PR 2)
 # ---------------------------------------------------------------------------
 
 
-def _sibling_dir(area_id: str, suffix: str) -> Path:
-    return data_root() / "areas" / f"{area_id}_{suffix}"
+def masks_root(area_id: str) -> Path:
+    return area_root(area_id) / "masks"
+
+
+def water_masks_dir(area_id: str) -> Path:
+    return masks_root(area_id) / "water"
+
+
+def seagrass_masks_dir(area_id: str) -> Path:
+    return masks_root(area_id) / "seagrass"
+
+
+def oyster_masks_dir(area_id: str) -> Path:
+    return masks_root(area_id) / "oyster"
 
 
 def water_mask_path(area_id: str, cell_id: str) -> Path:
-    return _sibling_dir(area_id, "google_water") / f"{cell_id}_water_mask.png"
+    return water_masks_dir(area_id) / f"{cell_id}_water_mask.png"
 
 
 def water_mask_overlay_path(area_id: str, cell_id: str) -> Path:
-    return _sibling_dir(area_id, "google_water") / f"{cell_id}_water_overlay.png"
+    return water_masks_dir(area_id) / f"{cell_id}_water_overlay.png"
 
 
 def water_styled_z16_path(area_id: str, cell_id: str) -> Path:
-    return _sibling_dir(area_id, "google_water") / f"{cell_id}_styled.png"
+    return water_masks_dir(area_id) / f"{cell_id}_styled.png"
 
 
 def water_z14_wide_styled_path(area_id: str, cell_id: str) -> Path:
-    return _sibling_dir(area_id, "google_water") / f"{cell_id}_wide_z14_styled.png"
+    return water_masks_dir(area_id) / f"{cell_id}_wide_z14_styled.png"
 
 
 def water_z13_isolation_styled_path(area_id: str, cell_id: str) -> Path:
-    return _sibling_dir(area_id, "google_water") / f"{cell_id}_wide_z13_styled.png"
+    return water_masks_dir(area_id) / f"{cell_id}_wide_z13_styled.png"
 
 
 def seagrass_mask_path(area_id: str, cell_id: str) -> Path:
-    return _sibling_dir(area_id, "habitats") / f"{cell_id}_seagrass_mask.png"
+    return seagrass_masks_dir(area_id) / f"{cell_id}_seagrass_mask.png"
 
 
 def oyster_mask_path(area_id: str, cell_id: str) -> Path:
-    return _sibling_dir(area_id, "habitats") / f"{cell_id}_oyster_mask.png"
+    return oyster_masks_dir(area_id) / f"{cell_id}_oyster_mask.png"
+
+
+def oyster_beds_geojson_path(area_id: str) -> Path:
+    """Area-level cached oyster-reef polygon geojson (shared across cells)."""
+    return masks_root(area_id) / "oyster_beds.geojson"
+
+
+def seagrass_geojson_path(area_id: str) -> Path:
+    """Area-level cached seagrass polygon geojson (shared across cells)."""
+    return masks_root(area_id) / "seagrass.geojson"
 
 
 # ---------------------------------------------------------------------------

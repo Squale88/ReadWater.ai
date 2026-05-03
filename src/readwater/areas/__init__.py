@@ -87,6 +87,29 @@ class Cell:
     def child_num(self) -> str:
         return self.cell_id.removeprefix("root-").split("-", 1)[1]
 
+    @property
+    def parent_id(self) -> str:
+        """Parent z14 cell id, e.g. ``"root-10"``."""
+        return self._entry.get("parent", f"root-{self.parent_num}")
+
+    @property
+    def cell_num(self) -> int:
+        """1-indexed cell number within the parent (1..16 for a 4x4 grid)."""
+        return int(self._entry.get("cell_num", self.child_num))
+
+    @property
+    def center(self) -> tuple[float, float] | None:
+        """(lat, lon) of the cell center, or None if not in the manifest."""
+        c = self._entry.get("center")
+        if c is None:
+            return None
+        return (float(c[0]), float(c[1]))
+
+    @property
+    def parent_bbox(self) -> dict | None:
+        """Parent z14 bbox dict (north/south/east/west) or None."""
+        return self.area.parent_bbox(self.parent_id)
+
     # ---- Generic accessors ----
 
     def has(self, kind: str) -> bool:
@@ -211,6 +234,14 @@ class Area:
 
     def has_cell(self, cell_id: str) -> bool:
         return cell_id in self._cells
+
+    def parent_bbox(self, parent_id: str) -> dict | None:
+        """Return the parent z14 bbox dict (or None) for ``parent_id`` like
+        ``"root-10"``. Used by Cell.parent_bbox + by the water_mask pipeline.
+        """
+        parents = self._manifest.get("parents", {})
+        entry = parents.get(parent_id)
+        return entry.get("bbox") if entry else None
 
     @property
     def schema_version(self) -> str:
