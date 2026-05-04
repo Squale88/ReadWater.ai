@@ -428,7 +428,7 @@ async def test_recursion_ancestor_contexts_is_empty_dict_in_step_7(tmp_path):
 
 
 from readwater.models.context import CellContext  # noqa: E402
-from readwater.models.structure import StructurePhaseResult  # noqa: E402
+from readwater.pipeline.cv.cell_pipeline import CellResult  # noqa: E402
 
 
 def _stub_grid_score_result(keep_cell_num: int = 1):
@@ -474,9 +474,9 @@ def live_recursion_patches(tmp_path):
     async def stub_dual_pass(*args, **kwargs):
         return _stub_grid_score_result(keep_cell_num=1)
 
-    async def stub_run_structure(**kwargs):
-        structure_calls.append(kwargs.get("cell_id"))
-        return StructurePhaseResult(cell_id=kwargs.get("cell_id", "x"))
+    def stub_run_cell_full(area_id, cell_id, **kwargs):
+        structure_calls.append(cell_id)
+        return CellResult(cell_id=cell_id, succeeded=True)
 
     async def stub_confirm(*args, **kwargs):
         return {"has_fishing_water": True, "raw_response": ""}
@@ -484,7 +484,7 @@ def live_recursion_patches(tmp_path):
     patchers = [
         patch.object(cell_analyzer, "build_cell_context", new=spy_build),
         patch.object(cell_analyzer, "dual_pass_grid_scoring", new=stub_dual_pass),
-        patch.object(cell_analyzer, "run_structure_phase", new=stub_run_structure),
+        patch.object(cell_analyzer, "run_cell_full", new=stub_run_cell_full),
         patch.object(cell_analyzer, "confirm_fishing_water", new=stub_confirm),
         patch.object(cell_analyzer, "draw_grid_overlay", return_value=str(tmp_path / "fake_grid.png")),
     ]
@@ -700,8 +700,8 @@ async def test_step8_failure_does_not_abort_recursion(tmp_path):
     async def stub_dual_pass(*args, **kwargs):
         return _stub_grid_score_result(keep_cell_num=1)
 
-    async def stub_run_structure(**kwargs):
-        return StructurePhaseResult(cell_id=kwargs.get("cell_id", "x"))
+    def stub_run_cell_full(area_id, cell_id, **kwargs):
+        return CellResult(cell_id=cell_id, succeeded=True)
 
     async def stub_confirm(*args, **kwargs):
         return {"has_fishing_water": True, "raw_response": ""}
@@ -709,7 +709,7 @@ async def test_step8_failure_does_not_abort_recursion(tmp_path):
     with (
         patch.object(cell_analyzer, "build_cell_context", new=failing_build),
         patch.object(cell_analyzer, "dual_pass_grid_scoring", new=stub_dual_pass),
-        patch.object(cell_analyzer, "run_structure_phase", new=stub_run_structure),
+        patch.object(cell_analyzer, "run_cell_full", new=stub_run_cell_full),
         patch.object(cell_analyzer, "confirm_fishing_water", new=stub_confirm),
         patch.object(
             cell_analyzer, "draw_grid_overlay",

@@ -30,9 +30,8 @@ from readwater.pipeline.context_bundle import (
     bundle_path_for,
     persist_bundle,
 )
+from readwater.pipeline.cv.cell_pipeline import run_cell_full
 from readwater.pipeline.image_processing import draw_grid_overlay
-from readwater.pipeline.structure import run_structure_phase
-from readwater.pipeline.structure.agent import StructureBudget
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +40,7 @@ logger = logging.getLogger(__name__)
 MILES_PER_DEG_LAT = 69.0
 EARTH_CIRCUMFERENCE_MILES = 24901.0
 SECTIONS = 4
-TERMINAL_ZOOM = 16  # structure phase owns zoom 18 and below
+TERMINAL_ZOOM = 16  # CV pipeline owns zoom 18 and below
 STRUCTURE_PHASE_ZOOM = 16
 Z15_CONTEXT_PROVIDER_ROLE = "overview"
 VALID_START_ZOOMS = {10, 12}
@@ -175,7 +174,6 @@ class _RunState:
     registry: ImageProviderRegistry | None = None
     threshold: float = 4.0
     start_zoom: int = 10
-    structure_budget: StructureBudget = field(default_factory=StructureBudget)
 
 
 def _save_metadata(state: _RunState) -> None:
@@ -202,7 +200,6 @@ async def analyze_cell(
     dry_run: bool = False,
     area_name: str = "default",
     output_dir: str | None = None,
-    structure_budget: StructureBudget | None = None,
 ) -> list[Cell]:
     """Recursively analyze a geographic cell via satellite imagery.
 
@@ -237,7 +234,6 @@ async def analyze_cell(
         registry=registry,
         threshold=threshold,
         start_zoom=start_zoom,
-        structure_budget=structure_budget or StructureBudget(),
     )
 
     cells = await _analyze_recursive(
@@ -501,59 +497,40 @@ async def _analyze_recursive(
                     "Z16 bundle assembly failed for %s: %s", cell_id, exc,
                 )
 
-        # --- Structure phase at zoom 16 (replaces old zoom-18 terminal) ---
-        # After dual-pass grid scoring completes on a zoom-16 cell, fetch its
-        # zoom-15 parent-context image and hand both to the structure agent,
-        # which owns all zoom-18 tile fetches and LLM calls internally.
+        # --- CV pipeline at zoom 16 (replaces deprecated LLM structure phase) ---
+        # After dual-pass grid scoring completes on a zoom-16 cell, hand it to
+        # the CV pipeline, which owns water mask, habitat masks, the four
+        # detectors, and the orchestrator. All zoom-18 tile fetches and CV
+        # work happen inside ``run_cell_full``; ``skip_existing=True`` means
+        # re-runs of cell_analyzer don't redo CV work that's already on disk.
         if is_structure_phase_cell and state.registry is not None:
             try:
-                z15_provider = state.registry.get_default_provider(Z15_CONTEXT_PROVIDER_ROLE)
-                z15_path = str(
-                    state.output_dir / _image_filename(cell_id, depth, "z15ctx")
-                )
-                if state.api_calls >= state.max_api_calls:
-                    logger.warning(
-                        "API limit reached before zoom-15 context fetch for %s", cell_id,
-                    )
-                else:
-                    await asyncio.sleep(0.5)
-                    await z15_provider.fetch(center, 15, z15_path)
-                    state.api_calls += 1
-
-                    # DEPRECATED CALL SITE — see DEPRECATED.md.
-                    # ``run_structure_phase`` belongs to the LLM-driven
-                    # structure pipeline that's been replaced by the CV
-                    # pipeline (``readwater.pipeline.cv``). A future PR will
-                    # rewire this call: either skip the structure phase and
-                    # let CV run separately via ``scripts/run_area.py``, or
-                    # delegate to a CV-based equivalent. Until then this is
-                    # the one remaining live consumer of the structure
-                    # subtree, which is why the subtree can't be deleted yet.
-                    structure_provider = state.registry.get_providers("structure")[0]
-                    structure_result = await run_structure_phase(
-                        cell_id=cell_id,
-                        cell_center=center,
-                        z15_image_path=z15_path,
-                        z16_image_path=first_image,
-                        provider=structure_provider,
-                        base_output_dir=state.output_dir,
-                        parent_context=parent_context,
-                        coverage_miles=size_miles,
-                        budget=state.structure_budget,
-                    )
-                    state.api_calls += structure_result.api_calls_used
-                    analysis.structures = list(structure_result.anchors)
+                # TODO: thread an explicit area_id through _RunState so multi-
+                # area discovery doesn't have to assume rookery_bay_v2. For now
+                # the cell_analyzer entry point doesn't carry area_id (only the
+                # display name area_name), and the only live consumer is
+                # rookery_bay_v2, so we hard-default here.
+                area_id = "rookery_bay_v2"
+                # CV pipeline manages its own API tracking inside water_mask
+                # and the detectors; we deliberately don't bump state.api_calls
+                # for CV work since that budget is for LLM/Claude calls.
+                result = run_cell_full(area_id, cell_id, skip_existing=True)
+                if result.succeeded or result.skipped:
+                    from readwater.areas import Area  # local import to avoid top-level cycle risk
+                    cv_anchors_path = Area(area_id).cell(cell_id).anchors_json
+                    analysis.structures = []
                     analysis.structure_analysis = {
-                        "anchors": [a.model_dump() for a in structure_result.anchors],
-                        "complexes": [c.model_dump() for c in structure_result.complexes],
-                        "influences": [i.model_dump() for i in structure_result.influences],
-                        "subzones": [s.model_dump() for s in structure_result.subzones],
-                        "deferred": [d.model_dump() for d in structure_result.deferred],
-                        "registry_path": structure_result.registry_path,
-                        "truncated": structure_result.truncated,
+                        "cv_anchors_path": str(cv_anchors_path),
                     }
+                else:
+                    logger.warning(
+                        "CV pipeline did not produce anchors for %s: status=%s error=%s",
+                        cell_id, result.status, result.error,
+                    )
+                    analysis.structures = []
+                    analysis.structure_analysis = {}
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Structure phase failed for cell %s: %s", cell_id, exc)
+                logger.warning("CV pipeline failed for cell %s: %s", cell_id, exc)
 
     first_image = next(iter(provider_images.values()), None)
     cell = Cell(
@@ -584,16 +561,8 @@ async def _analyze_recursive(
         "provider_images": dict(provider_images),
         "providers": list(provider_images.keys()),
     }
-    if analysis.structures:
-        meta_entry["structures_summary"] = [
-            {
-                "anchor_id": a.anchor_id,
-                "structure_type": a.structure_type,
-                "scale": a.scale,
-                "confidence": a.confidence,
-            }
-            for a in analysis.structures
-        ]
+    if analysis.structure_analysis.get("cv_anchors_path"):
+        meta_entry["cv_anchors_path"] = analysis.structure_analysis["cv_anchors_path"]
     if z16_bundle_path:
         meta_entry["context_bundle_path"] = z16_bundle_path
     state.metadata.append(meta_entry)
@@ -607,10 +576,10 @@ async def _analyze_recursive(
     # - Score >= threshold (5): recurse directly (confident keep)
     # - Score == AMBIGUOUS (3): fetch child image, run confirmation, recurse if confirmed
     # - Score < AMBIGUOUS (0 or dry_run below threshold): skip
-    # Structure-phase cells (zoom 16) already completed their per-anchor
-    # deeper investigation via run_structure_phase above; recursion from
-    # there is capped by TERMINAL_ZOOM so we never descend to zoom 18 through
-    # the recursive path.
+    # Structure-phase cells (zoom 16) already had their CV pipeline run via
+    # ``run_cell_full`` above (water mask, habitat masks, detectors,
+    # orchestrator); recursion from there is capped by TERMINAL_ZOOM so we
+    # never descend to zoom 18 through the recursive path.
     AMBIGUOUS_SCORE = 3.0
     next_zoom = zoom + 2
     if depth < max_depth and next_zoom <= TERMINAL_ZOOM:

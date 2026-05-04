@@ -34,7 +34,7 @@ from readwater.models.context import (
     VisualRole,
     Z16ContextBundle,
 )
-from readwater.pipeline.structure.geo import latlon_to_pixel
+from readwater.pipeline.geo import latlon_to_pixel
 
 logger = logging.getLogger(__name__)
 

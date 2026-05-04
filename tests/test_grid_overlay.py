@@ -1,4 +1,4 @@
-"""Tests for pipeline/structure/grid_overlay.py."""
+"""Tests for pipeline/grid_overlay.py."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from readwater.pipeline.structure.grid_overlay import (
+from readwater.pipeline.grid_overlay import (
     cell_pixel_rect,
     cells_to_bbox,
     cells_to_centroids,

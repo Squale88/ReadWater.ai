@@ -66,7 +66,7 @@ from readwater.pipeline.evidence import (  # noqa: E402
     build_evidence_table,
     format_evidence_for_prompt,
 )
-from readwater.pipeline.structure.grid_overlay import (  # noqa: E402
+from readwater.pipeline.grid_overlay import (  # noqa: E402
     cells_to_bbox,
     draw_label_grid,
     grid_shape_for_image,
