@@ -1,4 +1,7 @@
-"""Geometry extractors and dispatch.
+"""Geometry extractors and dispatch — DEPRECATED.
+
+Part of the LLM-driven structure pipeline replaced by ``readwater.pipeline.cv``.
+See ``DEPRECATED.md`` at the repo root.
 
 The agent chooses an extractor per feature based on (feature_type, extraction_mode).
 Phase 1.5 default is GridCellExtractor (cells→bbox polygon). ClickBoxExtractor

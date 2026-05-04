@@ -1,4 +1,4 @@
-"""Structure-phase orchestrator (Phase 1.5: grid-cell edition).
+"""Structure-phase orchestrator (Phase 1.5: grid-cell edition) — DEPRECATED.
 
 State machine:
   DISCOVER -> RANK_AND_DEFER -> per anchor:
@@ -13,6 +13,15 @@ State machine:
 Phase 1.5 uses GridCellExtractor for all features (polygon = bbox of cell
 union). Phase 2 replaces the region/corridor/edge_band extractors with SAM
 variants — same cell output from Claude, better polygon from the extractor.
+
+DEPRECATION NOTE
+================
+This LLM-driven structure pipeline has been replaced by the deterministic
+CV pipeline at ``readwater.pipeline.cv``. See ``DEPRECATED.md`` at the
+repo root for the full migration map. This module is kept around because
+``readwater.pipeline.cell_analyzer.run_structure_phase`` still calls into
+it; a future PR will rewire that call site and this whole subtree can be
+deleted. Do NOT add new consumers.
 """
 
 from __future__ import annotations
