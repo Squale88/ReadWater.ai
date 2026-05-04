@@ -6,9 +6,8 @@ Labels follow a spreadsheet convention:
   - Cols: 1..N (left to right)
   - A1 is always top-left.
 
-This file is pure geometry + Pillow drawing. No LLM involvement. The agent
-uses these helpers to render the gridded images it sends Claude and to
-convert Claude's cell responses back into pixel polygons.
+Pure geometry + Pillow drawing helpers. No I/O beyond writing the rendered
+grid PNG; no external dependencies aside from Pillow.
 """
 
 from __future__ import annotations

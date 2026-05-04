@@ -6,22 +6,22 @@ All tests use PlaceholderProvider — no API keys required.
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from readwater.api.providers.placeholder import PlaceholderProvider
 from readwater.api.providers.registry import ImageProviderRegistry
-from readwater.models.structure import StructurePhaseResult
 from readwater.pipeline.cell_analyzer import (
     analyze_cell,
     ground_coverage_miles,
 )
+from readwater.pipeline.cv.cell_pipeline import CellResult
 
 
-def _placeholder_structure_phase_result(cell_id: str = "test-cell") -> StructurePhaseResult:
-    """Empty structure-phase result — the pipeline tests don't exercise the agent itself."""
-    return StructurePhaseResult(cell_id=cell_id)
+def _placeholder_cell_result(cell_id: str = "test-cell") -> CellResult:
+    """Successful CellResult — pipeline tests don't exercise the CV detectors."""
+    return CellResult(cell_id=cell_id, succeeded=True)
 
 MARCO = (25.94, -81.73)
 MARCO_LAT = 25.94
@@ -70,9 +70,9 @@ def fast_registry(registry):
             return_value=_placeholder_dual_pass_result(),
         ),
         patch(
-            "readwater.pipeline.cell_analyzer.run_structure_phase",
-            new_callable=AsyncMock,
-            return_value=_placeholder_structure_phase_result(),
+            "readwater.pipeline.cell_analyzer.run_cell_full",
+            new_callable=MagicMock,
+            return_value=_placeholder_cell_result(),
         ),
         patch(
             "readwater.pipeline.cell_analyzer.confirm_fishing_water",
@@ -321,7 +321,7 @@ def _vision_patches():
     return (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
         patch("readwater.pipeline.cell_analyzer.dual_pass_grid_scoring", new_callable=AsyncMock, return_value=_placeholder_dual_pass_result()),
-        patch("readwater.pipeline.cell_analyzer.run_structure_phase", new_callable=AsyncMock, return_value=_placeholder_structure_phase_result()),
+        patch("readwater.pipeline.cell_analyzer.run_cell_full", new_callable=MagicMock, return_value=_placeholder_cell_result()),
         patch("readwater.pipeline.cell_analyzer.confirm_fishing_water", new_callable=AsyncMock, return_value=_placeholder_confirm_result()),
         patch("readwater.pipeline.cell_analyzer.draw_grid_overlay", side_effect=lambda p, **kw: p),
     )

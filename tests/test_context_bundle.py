@@ -16,7 +16,7 @@ from readwater.pipeline.context_bundle import (
     _bbox_to_pixel_rect,
     draw_footprint_overlay,
 )
-from readwater.pipeline.structure.geo import (
+from readwater.pipeline.geo import (
     deg_lat_per_pixel,
     deg_lon_per_pixel,
 )
@@ -768,25 +768,3 @@ def test_load_bundle_roundtrips_persisted_bundle(tmp_path):
     assert restored == bundle
 
 
-def test_structure_agent_is_byte_identical_to_master():
-    """Phase-1 hard rule: no edits at all to structure/agent.py.
-
-    Compares the local file to the master branch via git. This is a
-    regression guard — if someone makes any change to agent.py in this
-    branch, the test fails.
-    """
-    import subprocess
-
-    repo_root = Path(__file__).resolve().parents[1]
-    result = subprocess.run(
-        ["git", "diff", "master", "--", "src/readwater/pipeline/structure/agent.py"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, f"git diff failed: {result.stderr}"
-    assert result.stdout == "", (
-        "structure/agent.py has diverged from master in this branch, "
-        "which is forbidden in Phase 1:\n" + result.stdout
-    )

@@ -1,4 +1,4 @@
-"""Tests for pixel <-> lat/lon helpers in pipeline/structure/geo.py."""
+"""Tests for pixel <-> lat/lon helpers in pipeline/geo.py."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import math
 import pytest
 
 from readwater.pipeline.cell_analyzer import ground_coverage_miles
-from readwater.pipeline.structure.geo import (
+from readwater.pipeline.geo import (
     clip_polygon_to_rect,
     deg_lat_per_pixel,
     deg_lon_per_pixel,

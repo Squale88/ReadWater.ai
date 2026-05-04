@@ -10,53 +10,26 @@ the replacement instead.
 
 ---
 
-## `src/readwater/pipeline/structure/` — LLM-driven anchor pipeline
+## Removed
 
-**Status:** deprecated, but still imported by `cell_analyzer.py`. A future
-PR will rewire `cell_analyzer` to stop calling `run_structure_phase`; once
-that lands, this whole subtree can be deleted.
+### `src/readwater/pipeline/structure/` — LLM-driven anchor pipeline
 
-**Replaced by:** `src/readwater/pipeline/cv/` (deterministic CV-based
-anchor discovery). The CV pipeline produces equivalent anchor records
-without per-cell Claude vision calls — see
-`src/readwater/pipeline/cv/orchestrator.py` and the surrounding detector
-modules.
-
-**Files:**
-
-  - `structure/__init__.py`            — re-exports `run_structure_phase`
-  - `structure/agent.py`               — state-machine orchestrator (Claude vision)
-  - `structure/prompts.py`             — LLM prompt templates
-  - `structure/seed_validator.py`      — anchor-seed verification step
-  - `structure/mosaic.py`              — z18 mosaic helpers
-  - `structure/grid_overlay.py`        — grid-cell rendering
-  - `structure/geo.py`                 — geo helpers
-  - `structure/extractors/`            — region/clickbox/gridcell extractors
-
-**Known live consumers (these import the deprecated code today):**
-
-  - `src/readwater/pipeline/cell_analyzer.py` — calls `run_structure_phase`
-    at z16 during recursive discovery. Future rewire: skip the call (CV
-    runs separately via `scripts/run_area.py`) or delegate to it.
-  - `tests/test_structure_*.py` — test files for the deprecated agent.
-    Will be deleted with the implementation.
-  - `scripts/smoke_structure_phase.py`, `scripts/prompt_experiment.py` —
-    legacy validation scripts.
-
-**Migration path for new code:**
-
-  1. Discovery still happens via `cell_analyzer.py` (until the rewire).
-  2. CV pipeline runs via `python scripts/run_area.py --area <id>` and
-     produces `cv_all_*.json` per cell.
-  3. Downstream consumers (trip planner, future LLM interpretation phase)
-     should read the anchor JSON via `Area("...").cell(cid).anchors_json`
-     — not from any structure-pipeline output.
+Removed in this commit. Pure helpers (`geo`, `grid_overlay`) extracted to
+`readwater.pipeline.{geo, grid_overlay}`; LLM agent + extractors + prompts
++ mosaic + seed_validator deleted; `cell_analyzer` now calls
+`cv.cell_pipeline.run_cell_full` at the z16 hand-off point. Tests
+`tests/test_structure_*.py` and `scripts/smoke_structure_phase.py` were
+deleted alongside the implementation. Replacement: the CV pipeline
+(`src/readwater/pipeline/cv/`) — deterministic anchor discovery via
+`detect_drains` / `detect_islands` / `detect_points` / `detect_pockets`
+combined by `orchestrator`. Downstream consumers should read anchors via
+`Area(area_id).cell(cell_id).anchors_json`.
 
 ---
 
 ## `scripts/_cells.py` — hand-picked 9-cell test fixture
 
-**Status:** deprecated for CV pipeline, still imported by 4 non-CV scripts.
+**Status:** deprecated for CV pipeline, still imported by 3 non-CV scripts.
 
 **Replaced by:** `readwater.areas.Area`. Cells, centers, and parent bboxes
 are now indexed in `data/areas/<area>/manifest.json` and exposed through
@@ -74,10 +47,9 @@ for cell in area.cells():               # all 100 cells, not just the 9 hand-pic
 
   - `scripts/noaa_channel_mask.py`        — NOAA channel mask fetcher
   - `scripts/fetch_naip_tifs.py`          — NAIP raster fetcher
-  - `scripts/smoke_structure_phase.py`    — legacy structure-pipeline test
   - `scripts/prompt_experiment.py`        — prompt evaluation harness
 
-These four scripts pre-date the manifest and will be migrated (or
+These three scripts pre-date the manifest and will be migrated (or
 deprecated themselves) in follow-up PRs.
 
 ---
