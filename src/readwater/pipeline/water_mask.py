@@ -1,4 +1,19 @@
-"""NDWI-based water mask computation from 4-band NAIP imagery.
+"""NDWI primitives + 4-band NAIP I/O — shared math library.
+
+NOT DEPRECATED, despite naming overlap with the sunset NDWI-only water
+mask approach. The NDWI primitives here are still the canonical math for
+the new CV water-mask pipeline (see ``readwater.pipeline.cv.water_mask``,
+which imports ``compute_ndwi`` and ``load_4band_tif`` for the NAIP carve
+pass).
+
+What IS deprecated: the workflow of using NDWI alone to produce a final
+water mask. That approach over-claimed bright urban surfaces (roofs,
+asphalt) as water and was replaced by the layered Google-styled-tile +
+NAIP-carve + connectivity-filter pipeline. None of that workflow lives
+in this file — this is just primitives.
+
+If we ever rename this module to better reflect its role (e.g. to
+``ndwi.py``), do so as a refactor with full call-site updates.
 
 NDWI = (Green - NIR) / (Green + NIR)
 
@@ -10,7 +25,7 @@ Functions here are pure numpy — the rasterio dependency is isolated to the
 load/save helpers at the bottom so the core NDWI math is testable without
 geospatial setup.
 
-Typical use:
+Typical use (as building blocks for a larger water-mask pipeline):
 
     from readwater.api.data_sources.naip_4band import fetch_naip_4band, bbox_from_center
     from readwater.pipeline.water_mask import (
@@ -21,7 +36,9 @@ Typical use:
     bands = load_4band_tif(result.path)
     ndwi = compute_ndwi(bands.green, bands.nir)
     mask = threshold_water(ndwi, threshold=0.1)
-    save_mask_png(mask, "out/tile_watermask.png")
+    # Don't ship `mask` as your final water mask; combine it with Google
+    # styled tiles and a connectivity filter (see cv.water_mask) for
+    # production use.
 
 Dependencies: numpy always; rasterio only for the load/save helpers that
 touch GeoTIFFs. Pure-numpy consumers can pass arrays directly.

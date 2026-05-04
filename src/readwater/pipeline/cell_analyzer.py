@@ -520,6 +520,15 @@ async def _analyze_recursive(
                     await z15_provider.fetch(center, 15, z15_path)
                     state.api_calls += 1
 
+                    # DEPRECATED CALL SITE — see DEPRECATED.md.
+                    # ``run_structure_phase`` belongs to the LLM-driven
+                    # structure pipeline that's been replaced by the CV
+                    # pipeline (``readwater.pipeline.cv``). A future PR will
+                    # rewire this call: either skip the structure phase and
+                    # let CV run separately via ``scripts/run_area.py``, or
+                    # delegate to a CV-based equivalent. Until then this is
+                    # the one remaining live consumer of the structure
+                    # subtree, which is why the subtree can't be deleted yet.
                     structure_provider = state.registry.get_providers("structure")[0]
                     structure_result = await run_structure_phase(
                         cell_id=cell_id,

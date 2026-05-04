@@ -1,4 +1,31 @@
-"""Central registry of test cells used by every validation script.
+"""Central registry of test cells used by every validation script — DEPRECATED.
+
+Hand-picked 9-cell subset that pre-dates the area manifest. **Replaced
+by ``readwater.areas.Area``,** which loads the canonical cell registry
+from ``data/areas/<area>/manifest.json`` (currently 100 cells in
+rookery_bay_v2 vs the legacy 9 here). See ``DEPRECATED.md`` at the
+repo root.
+
+This file is kept around because four legacy scripts still import from
+it: ``noaa_channel_mask.py``, ``fetch_naip_tifs.py``,
+``smoke_structure_phase.py``, ``prompt_experiment.py``. They'll be
+migrated (or deprecated themselves) in follow-up PRs; once the last
+consumer is gone this file can be deleted.
+
+Migration recipe:
+
+    # OLD
+    from _cells import CELLS
+    spec = CELLS["root-10-8"]
+    center = spec["cell_center"]
+
+    # NEW
+    from readwater.areas import Area
+    cell = Area("rookery_bay_v2").cell("root-10-8")
+    center = cell.center
+
+ORIGINAL DOC FOLLOWS
+====================
 
 Having one authoritative CELLS dict means mask-generation and
 prompt-experiment scripts can't drift on center coordinates, zoom, or
@@ -17,17 +44,19 @@ Centers are derived from the row/col of the cell inside its parent bbox
 using the exact math `readwater.pipeline.cell_analyzer._subdivide_bbox`
 uses (confirmed by round-tripping root-10-8 and root-11-5 against the
 existing hand-copied values in prompt_experiment.py).
-
-The 8 cells below span the Rookery Bay / Marco Island / Naples area from
-roughly N 26.10 to N 25.97 and W -81.80 to W -81.71 — enough diversity
-of structure types (open bay, mangrove shoreline, tidal cuts, oyster bars,
-grass flats) to evaluate whether the evidence-injection approach holds up
-outside the original 2-cell test set.
 """
 
 from __future__ import annotations
 
+import warnings as _warnings
 from pathlib import Path
+
+_warnings.warn(
+    "scripts/_cells.py is deprecated; use readwater.areas.Area instead. "
+    "See DEPRECATED.md at the repo root.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 REPO_ROOT = Path("D:/dropbox_root/Dropbox/CascadeProjects/ReadWater.ai")
 IMAGES_ROOT = REPO_ROOT / "data" / "areas" / "rookery_bay_v2" / "images"
