@@ -424,29 +424,43 @@ async def test_recursion_ancestor_contexts_is_empty_dict_in_step_7(tmp_path):
         assert entry["ancestor_contexts_keys"] == []
 
 
-# --- Step 8: build_cell_context invoked on each retained cell ---
+# --- Live (non-dry-run) recursion fixture ---
+#
+# The original "Step 8" build_cell_context tests were deleted when the
+# LLM-driven cell-context pass was removed (the bundle is now a
+# structural skeleton — see DEPRECATED.md and cell_analyzer.py for the
+# rationale). Step 9 (z16 bundle on disk) tests survive in slimmer form:
+# the bundle still gets written, just without per-cell CellContext
+# objects and without the Z15_SAME_CENTER visual.
 
 
-from readwater.models.context import CellContext  # noqa: E402
+from readwater.models.cell import CellAnalysis, CellScore  # noqa: E402
 from readwater.pipeline.cv.cell_pipeline import CellResult  # noqa: E402
 
 
-def _stub_grid_score_result(keep_cell_num: int = 1):
-    """Grid-scoring payload that keeps exactly one sub-cell."""
-    return {
-        "summary": "stub",
-        "hydrology_notes": "",
-        "sub_scores": [
-            {
-                "cell_number": i,
-                "score": 5 if i == keep_cell_num else 0,
-                "reasoning": "stub",
-            }
-            for i in range(1, 17)
-        ],
-        "raw_response_yes": "",
-        "raw_response_no": "",
-    }
+def _stub_cv_analysis(sub_cells_map: dict, keep_cell_num: int = 1) -> CellAnalysis:
+    """CellAnalysis stub matching what _score_subcells_via_cv_rubric returns.
+
+    Keeps exactly one sub-cell (default cell 1) so the recursion narrows down
+    to a single-child fanout per level (root -> root-1 -> root-1-1).
+    """
+    sub_scores: list[CellScore] = []
+    for r in range(4):
+        for c in range(4):
+            cell_n = r * 4 + c + 1
+            score = 5.0 if cell_n == keep_cell_num else 0.0
+            center = sub_cells_map.get((r, c), MARCO)
+            sub_scores.append(CellScore(
+                row=r, col=c, score=score,
+                summary="stub cv-rubric",
+                center=center,
+            ))
+    return CellAnalysis(
+        overall_summary="stub cv-rubric (1/16 kept)",
+        sub_scores=sub_scores,
+        hydrology_notes="",
+        model_used="cv-rubric-v1",
+    )
 
 
 @pytest.fixture
@@ -454,130 +468,26 @@ def live_recursion_patches(tmp_path):
     """Install patches that let analyze_cell run non-dry-run without any
     real Claude API calls. Yields a dict of recorders the test can inspect."""
 
-    build_calls: list[dict] = []
-    structure_calls: list[dict] = []
+    structure_calls: list[str] = []
 
-    async def spy_build(**kwargs):
-        build_calls.append({
-            "cell_id": kwargs["cell_id"],
-            "zoom": kwargs["zoom"],
-            "ancestor_lineage_ids": [
-                r.cell_id for r in (kwargs.get("ancestor_lineage") or [])
-            ],
-            "ancestor_context_keys": list(
-                (kwargs.get("ancestor_contexts") or {}).keys()
-            ),
-            "grid_scoring_summary": (kwargs.get("grid_scoring_result") or {}).get("summary"),
-        })
-        return CellContext(cell_id=kwargs["cell_id"], zoom=kwargs["zoom"])
-
-    async def stub_dual_pass(*args, **kwargs):
-        return _stub_grid_score_result(keep_cell_num=1)
+    def stub_cv_rubric(bbox, parent_zoom, sub_cells_map, output_dir):
+        return _stub_cv_analysis(sub_cells_map, keep_cell_num=1)
 
     def stub_run_cell_full(area_id, cell_id, **kwargs):
         structure_calls.append(cell_id)
         return CellResult(cell_id=cell_id, succeeded=True)
 
-    async def stub_confirm(*args, **kwargs):
-        return {"has_fishing_water": True, "raw_response": ""}
-
     patchers = [
-        patch.object(cell_analyzer, "build_cell_context", new=spy_build),
-        patch.object(cell_analyzer, "dual_pass_grid_scoring", new=stub_dual_pass),
+        patch.object(cell_analyzer, "_score_subcells_via_cv_rubric", new=stub_cv_rubric),
         patch.object(cell_analyzer, "run_cell_full", new=stub_run_cell_full),
-        patch.object(cell_analyzer, "confirm_fishing_water", new=stub_confirm),
-        patch.object(cell_analyzer, "draw_grid_overlay", return_value=str(tmp_path / "fake_grid.png")),
     ]
     for p in patchers:
         p.start()
     try:
-        yield {"build_calls": build_calls, "structure_calls": structure_calls}
+        yield {"structure_calls": structure_calls}
     finally:
         for p in patchers:
             p.stop()
-
-
-@pytest.mark.asyncio
-async def test_step8_build_cell_context_called_once_per_retained_cell(
-    tmp_path, live_recursion_patches,
-):
-    registry = _make_dry_run_registry()
-    cells = await cell_analyzer.analyze_cell(
-        center=MARCO,
-        registry=registry,
-        start_zoom=12,
-        max_depth=2,
-        max_api_calls=1000,
-        dry_run=False,
-        output_dir=str(tmp_path),
-    )
-    # With only cell 1 retained at each step: root, root-1, root-1-1.
-    ids = [c.id for c in cells]
-    assert set(ids) == {"root", "root-1", "root-1-1"}
-
-    build_ids = [c["cell_id"] for c in live_recursion_patches["build_calls"]]
-    assert sorted(build_ids) == ["root", "root-1", "root-1-1"]
-
-
-@pytest.mark.asyncio
-async def test_step8_cell_context_stored_on_analysis(
-    tmp_path, live_recursion_patches,
-):
-    registry = _make_dry_run_registry()
-    cells = await cell_analyzer.analyze_cell(
-        center=MARCO,
-        registry=registry,
-        start_zoom=12,
-        max_depth=2,
-        max_api_calls=1000,
-        dry_run=False,
-        output_dir=str(tmp_path),
-    )
-    for cell in cells:
-        assert cell.analysis is not None
-        assert cell.analysis.context is not None
-        assert cell.analysis.context.cell_id == cell.id
-        assert cell.analysis.context.zoom == cell.zoom_level
-
-
-@pytest.mark.asyncio
-async def test_step8_ancestor_contexts_propagate_to_children(
-    tmp_path, live_recursion_patches,
-):
-    registry = _make_dry_run_registry()
-    await cell_analyzer.analyze_cell(
-        center=MARCO,
-        registry=registry,
-        start_zoom=12,
-        max_depth=2,
-        max_api_calls=1000,
-        dry_run=False,
-        output_dir=str(tmp_path),
-    )
-    calls = {c["cell_id"]: c for c in live_recursion_patches["build_calls"]}
-
-    assert calls["root"]["ancestor_context_keys"] == []
-    assert calls["root-1"]["ancestor_context_keys"] == ["root"]
-    assert set(calls["root-1-1"]["ancestor_context_keys"]) == {"root", "root-1"}
-
-
-@pytest.mark.asyncio
-async def test_step8_grid_scoring_digest_is_passed_to_build(
-    tmp_path, live_recursion_patches,
-):
-    registry = _make_dry_run_registry()
-    await cell_analyzer.analyze_cell(
-        center=MARCO,
-        registry=registry,
-        start_zoom=12,
-        max_depth=0,
-        max_api_calls=1000,
-        dry_run=False,
-        output_dir=str(tmp_path),
-    )
-    root = live_recursion_patches["build_calls"][0]
-    # The stub dual_pass_grid_scoring returns summary="stub".
-    assert root["grid_scoring_summary"] == "stub"
 
 
 # --- Step 9: Z16 bundle written to disk at handoff ---
@@ -609,16 +519,19 @@ async def test_step9_z16_bundle_written_at_handoff(
     bundle = Z16ContextBundle.model_validate_json(
         bundle_path.read_text(encoding="utf-8"),
     )
-    # 4 visuals for a z12-start run.
+    # 3 visuals for a z12-start run. (Z15_SAME_CENTER is omitted because
+    # cell_analyzer no longer fetches it — the per-z16 z15 fetch was
+    # removed alongside build_cell_context. See cell_analyzer.py for
+    # the rationale.)
     assert set(bundle.visuals.keys()) == {
         VisualRole.Z16_LOCAL,
-        VisualRole.Z15_SAME_CENTER,
         VisualRole.Z14_PARENT,
         VisualRole.Z12_GRANDPARENT,
     }
-    # 3 context entries (root, root-1, root-1-1).
-    assert set(bundle.contexts.keys()) == {"root", "root-1", "root-1-1"}
-    # Lineage traversal order root -> parent -> self.
+    # Contexts dict is empty (build_cell_context call removed).
+    assert bundle.contexts == {}
+    # Lineage traversal order root -> parent -> self (always populated
+    # from recursion state, regardless of whether contexts were built).
     assert [r.cell_id for r in bundle.lineage] == ["root", "root-1", "root-1-1"]
 
 
@@ -688,45 +601,8 @@ async def test_step9_no_bundle_in_dry_run(tmp_path):
     assert not (tmp_path / "structures").exists()
 
 
-@pytest.mark.asyncio
-async def test_step8_failure_does_not_abort_recursion(tmp_path):
-    """If build_cell_context raises, analysis.context stays None and
-    recursion continues."""
-    registry = _make_dry_run_registry()
-
-    async def failing_build(**kwargs):
-        raise RuntimeError("boom")
-
-    async def stub_dual_pass(*args, **kwargs):
-        return _stub_grid_score_result(keep_cell_num=1)
-
-    def stub_run_cell_full(area_id, cell_id, **kwargs):
-        return CellResult(cell_id=cell_id, succeeded=True)
-
-    async def stub_confirm(*args, **kwargs):
-        return {"has_fishing_water": True, "raw_response": ""}
-
-    with (
-        patch.object(cell_analyzer, "build_cell_context", new=failing_build),
-        patch.object(cell_analyzer, "dual_pass_grid_scoring", new=stub_dual_pass),
-        patch.object(cell_analyzer, "run_cell_full", new=stub_run_cell_full),
-        patch.object(cell_analyzer, "confirm_fishing_water", new=stub_confirm),
-        patch.object(
-            cell_analyzer, "draw_grid_overlay",
-            return_value=str(tmp_path / "fake_grid.png"),
-        ),
-    ):
-        cells = await cell_analyzer.analyze_cell(
-            center=MARCO,
-            registry=registry,
-            start_zoom=12,
-            max_depth=1,
-            max_api_calls=1000,
-            dry_run=False,
-            output_dir=str(tmp_path),
-        )
-    # We still got both the root and its surviving child.
-    assert {c.id for c in cells} == {"root", "root-1"}
-    # Every cell's context is None because build raised.
-    for c in cells:
-        assert c.analysis.context is None
+# test_step8_failure_does_not_abort_recursion was deleted alongside the
+# build_cell_context call: there's no per-cell LLM step left in
+# cell_analyzer that could fail this way. analysis.context is now always
+# None (see cell_analyzer's "Z16 context bundle assembly (Step 9) —
+# SKELETON FORM" comment).

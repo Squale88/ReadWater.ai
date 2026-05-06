@@ -15,23 +15,20 @@ import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from readwater.api.claude_vision import (
-    MODEL,
-    _cell_number_to_row_col,
-    confirm_fishing_water,
-    dual_pass_grid_scoring,
-)
 from readwater.api.providers.registry import ImageProviderRegistry
 from readwater.models.cell import BoundingBox, Cell, CellAnalysis, CellScore
 from readwater.models.context import CellContext, LineageRef
 from readwater.pipeline.context_bundle import (
     assemble_z16_bundle,
-    build_cell_context,
     bundle_path_for,
     persist_bundle,
 )
 from readwater.pipeline.cv.cell_pipeline import run_cell_full
-from readwater.pipeline.image_processing import draw_grid_overlay
+from readwater.pipeline.cv.discovery import evaluate_subcells
+
+# Tag stored in CellAnalysis.model_used to mark records produced by the
+# deterministic CV rubric (vs the LLM-driven scoring it replaces).
+CV_RUBRIC_VERSION = "cv-rubric-v1"
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +154,86 @@ def _role_for_zoom(zoom: int) -> str:
     if zoom >= 16:
         return "structure"
     return "overview"
+
+
+# --- Deterministic CV-rubric scoring (replaces LLM dual_pass_grid_scoring) ---
+
+
+def _score_subcells_via_cv_rubric(
+    bbox: BoundingBox,
+    parent_zoom: int,
+    sub_cells_map: dict[tuple[int, int], tuple[float, float]],
+    output_dir: Path,
+) -> CellAnalysis:
+    """Score a cell's 16 sub-cells using the deterministic CV rubric.
+
+    Wraps ``readwater.pipeline.cv.discovery.evaluate_subcells``: fetches
+    detail (parent_zoom) + isolation (parent_zoom-1) styled water tiles
+    centered on this cell, computes the per-sub-cell metrics
+    (water_pct, land_pct, widest_water_m, n_ccs), applies the rubric,
+    and projects the binary keep/drop decision into the legacy CellScore
+    shape (5.0 = keep, 0.0 = drop) so the rest of cell_analyzer's
+    recursion path is unchanged.
+
+    Tiles are cached under ``output_dir / "_discovery_cache"`` and reused
+    across runs / sibling cells that share an evaluator center.
+
+    The ``summary`` field on each CellScore captures the rubric metrics
+    (e.g. ``"water_pct=12.3%, land_pct=78.1%, widest=240m"``) plus the
+    drop reason for skipped cells, so downstream consumers can audit
+    every decision without re-running the rubric.
+    """
+    parent_bb = {
+        "north": bbox.north, "south": bbox.south,
+        "east":  bbox.east,  "west":  bbox.west,
+    }
+    cache_dir = Path(output_dir) / "_discovery_cache"
+    # Label used for tile filenames; coords-based so sibling cells at the same
+    # zoom don't collide and so re-runs of the same cell hit the cache.
+    label = (f"z{parent_zoom}"
+             f"_{round(bbox.south, 4)}_{round(bbox.west, 4)}")
+    evals = evaluate_subcells(parent_bb, parent_zoom, cache_dir, label)
+
+    sub_scores: list[CellScore] = []
+    for ev in evals:
+        row = (ev.cell_num - 1) // SECTIONS
+        col = (ev.cell_num - 1) % SECTIONS
+        # Each sub-cell's geographic center comes from the geometric
+        # subdivision the caller already computed (sub_cells_map keyed by
+        # row/col -> (lat, lon)).
+        sub_center = sub_cells_map.get((row, col), bbox_center_tuple(bbox))
+        score = 5.0 if ev.kept else 0.0
+        summary_parts = [
+            f"water_pct={ev.water_pct}%",
+            f"land_pct={ev.land_pct}%",
+            f"widest={ev.widest_m}m",
+            f"ccs={ev.n_ccs}",
+        ]
+        if ev.drop_reason:
+            summary_parts.append(f"DROP={ev.drop_reason}")
+        sub_scores.append(CellScore(
+            row=row, col=col,
+            score=score,
+            summary="; ".join(summary_parts),
+            center=sub_center,
+        ))
+
+    n_kept = sum(1 for s in sub_scores if s.score >= 5.0)
+    return CellAnalysis(
+        overall_summary=(
+            f"Deterministic CV rubric (z{parent_zoom} detail + "
+            f"z{parent_zoom-1} isolation): "
+            f"{n_kept}/{len(sub_scores)} sub-cells kept"
+        ),
+        sub_scores=sub_scores,
+        hydrology_notes="",
+        model_used=CV_RUBRIC_VERSION,
+    )
+
+
+def bbox_center_tuple(bbox: BoundingBox) -> tuple[float, float]:
+    """Helper: BoundingBox -> (lat, lon) center as a tuple."""
+    return ((bbox.north + bbox.south) / 2, (bbox.east + bbox.west) / 2)
 
 
 # --- Run state ---
@@ -354,122 +431,49 @@ async def _analyze_recursive(
         first_image = next(iter(provider_images.values()))
         is_structure_phase_cell = zoom == STRUCTURE_PHASE_ZOOM
 
-        # --- Grid scoring (dual-pass with wider context image) ---
-        grid_path = draw_grid_overlay(first_image)
-
-        # Fetch a wider-area context image at zoom-1 (2x coverage) at same center.
-        # Gives the model surrounding context to distinguish interior bay water
-        # from open ocean, and to see whether residential canals reach a bay.
-        context_image_path = None
-        if state.api_calls < state.max_api_calls and zoom > 1:
-            try:
-                context_zoom = zoom - 1
-                context_filename = (
-                    Path(first_image).stem + f"_context_z{context_zoom}.png"
-                )
-                context_image_path = str(state.output_dir / context_filename)
-                if state.api_calls > 0:
-                    await asyncio.sleep(0.5)
-                provider = state.registry.get_default_provider(_role_for_zoom(zoom))
-                await provider.fetch(center, context_zoom, context_image_path)
-                state.api_calls += 1
-            except Exception as e:
-                logger.warning("Context image fetch failed for %s: %s", cell_id, e)
-                context_image_path = None
-
+        # --- Deterministic CV-rubric scoring (replaces LLM dual-pass scoring) ---
+        # See readwater.pipeline.cv.discovery.evaluate_subcells for the rubric:
+        #   detail tile at parent_zoom + isolation tile at parent_zoom-1
+        #   ocean_connected = perim_connected(detail) AND NOT isolated(isolation)
+        #   per sub-cell: KEEP if land_pct >= 3% AND water_pct >= threshold
+        #                 (level-2 only) AND widest_water_m >= 50m
+        # Tile fetches happen inside evaluate_subcells via storage helpers; no
+        # need to fetch the LLM-style grid overlay or wider context image.
         try:
-            vision_result = await dual_pass_grid_scoring(
-                grid_path, parent_context, zoom, center, size_miles,
-                context_image_path=context_image_path,
+            analysis = _score_subcells_via_cv_rubric(
+                bbox, zoom, sub_cells_map, state.output_dir,
             )
-            # Save raw responses as markdown
-            raw_yes = vision_result.pop("raw_response_yes", "")
-            raw_no = vision_result.pop("raw_response_no", "")
-            vision_result.pop("raw_response", None)  # consumed but not persisted
-            grid_stem = Path(grid_path).stem
-            grid_dir = Path(grid_path).parent
-            if raw_yes:
-                (grid_dir / f"{grid_stem}_yes.md").write_text(raw_yes, encoding="utf-8")
-            if raw_no:
-                (grid_dir / f"{grid_stem}_no.md").write_text(raw_no, encoding="utf-8")
-            scored_cells = []
-            for sc in vision_result.get("sub_scores", []):
-                row, col = _cell_number_to_row_col(sc["cell_number"])
-                scored_cells.append(CellScore(
-                    row=row,
-                    col=col,
-                    score=float(sc["score"]),
-                    summary=sc.get("reasoning", ""),
-                    center=sub_cells_map.get((row, col), center),
-                ))
+        except Exception as e:  # noqa: BLE001 — capture any rubric failure
+            logger.warning("CV rubric scoring failed for cell %s: %s", cell_id, e)
             analysis = CellAnalysis(
-                overall_summary=vision_result.get("summary", ""),
-                sub_scores=scored_cells,
-                hydrology_notes=vision_result.get("hydrology_notes", ""),
-                model_used=MODEL,
-            )
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning("Grid analysis failed for cell %s: %s", cell_id, e)
-            analysis = CellAnalysis(
-                overall_summary=f"Analysis failed: {e}",
+                overall_summary=f"CV rubric failed: {e}",
                 sub_scores=[
-                    CellScore(row=r, col=c, score=0.0, summary="Analysis error", center=ctr)
+                    CellScore(row=r, col=c, score=0.0, summary="rubric error", center=ctr)
                     for r, c, ctr in sub_cells_geo
                 ],
-                model_used=MODEL,
+                model_used=CV_RUBRIC_VERSION,
             )
 
-        # --- Retained-cell context pass (Step 8) ---
-        # Every cell reached by _analyze_recursive is by definition retained
-        # (pruning happens above at the parent). Run the descriptive pass now
-        # so the resulting CellContext is available to this cell's children
-        # and to Step 9's z16 bundle assembly. Failures are non-fatal —
-        # analysis.context just stays None.
-        if state.api_calls < state.max_api_calls:
-            try:
-                await asyncio.sleep(0.5)
-                context_digest = {
-                    "summary": analysis.overall_summary,
-                    "hydrology_notes": analysis.hydrology_notes,
-                    "sub_scores": [
-                        {"score": s.score} for s in analysis.sub_scores
-                    ],
-                }
-                cell_context = await build_cell_context(
-                    cell_id=cell_id,
-                    zoom=zoom,
-                    image_path=first_image,
-                    center=center,
-                    coverage_miles=size_miles,
-                    ancestor_lineage=ancestor_lineage,
-                    ancestor_contexts=ancestor_contexts,
-                    grid_scoring_result=context_digest,
-                    model_used=MODEL,
-                )
-                analysis.context = cell_context
-                state.api_calls += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Cell-context pass failed for %s: %s", cell_id, exc,
-                )
-                analysis.context = None
-        else:
-            logger.warning(
-                "API limit reached (%d), skipping cell-context for %s",
-                state.max_api_calls, cell_id,
-            )
-
-        # --- Z16 context bundle assembly (Step 9) ---
-        # Compile the multi-scale context package BEFORE handing the cell to
-        # the structure phase. The bundle is written to disk at a stable path
-        # under structures/{cell_id}/context_bundle.json. Structure-phase code
-        # is not changed in this phase; the bundle is simply inert on disk
-        # for later consumption.
-        if (
-            is_structure_phase_cell
-            and state.registry is not None
-            and analysis.context is not None
-        ):
+        # --- Z16 context bundle assembly (Step 9) — SKELETON FORM ---
+        # The bundle WAS the input package for the LLM-driven structure
+        # pipeline (deleted in PR #19). The future analyzer that
+        # determines wind/current/weather/season impact at the closest
+        # zoom level will need *something* like this — but its exact
+        # shape isn't pinned down yet (LLM vs. deterministic, what
+        # inputs it needs).
+        #
+        # We keep ``assemble_z16_bundle`` running here as a structural
+        # framework so the file shape and writer path stay alive for
+        # future extension. We DO NOT pay for the expensive per-cell
+        # inputs:
+        #   * ``build_cell_context`` (LLM call per retained cell) — REMOVED
+        #   * z15 same-center fetch (1 API call per z16 cell) — REMOVED
+        # As a result the bundle's ``contexts`` dict is empty and its
+        # ``visuals`` set is {Z16_LOCAL, Z14_PARENT, Z12_GRANDPARENT}
+        # (no Z15_SAME_CENTER). Each visual references images already
+        # on disk from the recursive image fetch; the bundle assembly
+        # itself is essentially free.
+        if is_structure_phase_cell and state.registry is not None:
             try:
                 self_lineage_ref = LineageRef(
                     cell_id=cell_id,
@@ -482,10 +486,10 @@ async def _analyze_recursive(
                 )
                 bundle = assemble_z16_bundle(
                     self_lineage=self_lineage_ref,
-                    self_context=analysis.context,
+                    self_context=None,
                     ancestor_lineage=ancestor_lineage,
-                    ancestor_contexts=ancestor_contexts,
-                    z15_same_center_path=context_image_path,
+                    ancestor_contexts={},
+                    z15_same_center_path=None,
                     base_output_dir=state.output_dir,
                 )
                 z16_bundle_path = persist_bundle(
@@ -570,70 +574,26 @@ async def _analyze_recursive(
     all_cells = [cell]
 
     # --- Recurse into sub-cells ---
-    # Dual-pass scoring produces: 5 (confident keep), 3 (ambiguous), 0 (confident prune)
-    # In dry_run mode, placeholder scores are 5 and threshold controls pruning directly.
-    # In live mode:
-    # - Score >= threshold (5): recurse directly (confident keep)
-    # - Score == AMBIGUOUS (3): fetch child image, run confirmation, recurse if confirmed
-    # - Score < AMBIGUOUS (0 or dry_run below threshold): skip
-    # Structure-phase cells (zoom 16) already had their CV pipeline run via
-    # ``run_cell_full`` above (water mask, habitat masks, detectors,
-    # orchestrator); recursion from there is capped by TERMINAL_ZOOM so we
-    # never descend to zoom 18 through the recursive path.
-    AMBIGUOUS_SCORE = 3.0
+    # CV-rubric scoring is BINARY: each sub_score is either 5.0 (KEEP) or
+    # 0.0 (DROP). The legacy ambiguous-score path (score == 3.0 -> fetch
+    # child + LLM confirm_fishing_water) is therefore dead with the CV
+    # rubric in place; it's been removed alongside the LLM imports.
+    # Structure-phase cells (zoom 16) already had their CV pipeline run
+    # via ``run_cell_full`` above (water mask, habitat masks, detectors,
+    # orchestrator); recursion from there is capped by TERMINAL_ZOOM so
+    # we never descend to zoom 18 through the recursive path.
     next_zoom = zoom + 2
     if depth < max_depth and next_zoom <= TERMINAL_ZOOM:
         for sub_score in analysis.sub_scores:
             # In dry_run mode, honor threshold directly (placeholder scores = 5)
             if state.dry_run and sub_score.score < state.threshold:
                 continue
-            # In live mode, only skip confident prunes (below AMBIGUOUS_SCORE).
-            # Ambiguous cells (score 3) will get a confirmation check below.
-            if not state.dry_run and sub_score.score < AMBIGUOUS_SCORE:
+            # In live mode, CV rubric drops produce score 0.0; keeps produce 5.0.
+            if not state.dry_run and sub_score.score < state.threshold:
                 continue
 
             child_id = _make_cell_id(cell_id, sub_score.row, sub_score.col)
             child_bbox = _sub_cell_bbox(bbox, sub_score.row, sub_score.col, SECTIONS)
-
-            # Ambiguous cells: fetch image and run confirmation before recursing
-            if sub_score.score == AMBIGUOUS_SCORE and not state.dry_run:
-                # Fetch the child image for confirmation
-                child_size = ground_coverage_miles(next_zoom, sub_score.center[0])
-                child_filename = _image_filename(child_id, depth + 1)
-                role = _role_for_zoom(next_zoom)
-
-                if state.api_calls >= state.max_api_calls:
-                    continue
-                if state.api_calls > 0:
-                    await asyncio.sleep(0.5)
-                provider = state.registry.get_default_provider(role)
-                child_img_path = str(state.output_dir / child_filename)
-                await provider.fetch(sub_score.center, next_zoom, child_img_path)
-                state.api_calls += 1
-
-                # Run confirmation on the fetched image
-                try:
-                    confirm_result = await confirm_fishing_water(
-                        child_img_path, analysis.overall_summary,
-                        sub_score.center, child_size,
-                    )
-                    raw_confirm = confirm_result.pop("raw_response", "")
-                    if raw_confirm:
-                        md_path = Path(child_img_path).with_name(
-                            Path(child_img_path).stem + "_confirm.md"
-                        )
-                        md_path.write_text(raw_confirm, encoding="utf-8")
-
-                    if not confirm_result.get("has_fishing_water", False):
-                        logger.info(
-                            "Ambiguous cell %s rejected by confirmation: %s",
-                            child_id, confirm_result.get("reasoning", ""),
-                        )
-                        continue  # Skip this cell
-                    logger.info("Ambiguous cell %s confirmed as fishable", child_id)
-                except Exception as e:
-                    logger.warning("Confirmation failed for %s: %s", child_id, e)
-                    continue  # Skip on error
 
             self_lineage = LineageRef(
                 cell_id=cell_id,

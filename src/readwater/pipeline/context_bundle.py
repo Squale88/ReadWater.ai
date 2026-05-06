@@ -521,7 +521,7 @@ def _footprint_label(inner: LineageRef, is_self: bool) -> str:
 
 def assemble_z16_bundle(
     self_lineage: LineageRef,
-    self_context: CellContext,
+    self_context: CellContext | None,
     ancestor_lineage: list[LineageRef],
     ancestor_contexts: dict[str, CellContext],
     z15_same_center_path: str | None,
@@ -534,6 +534,13 @@ def assemble_z16_bundle(
     Base images are never mutated. Returns the in-memory bundle; the caller
     is responsible for persistence via persist_bundle.
 
+    self_context may be None when the caller doesn't have a CellContext
+    for this cell (e.g. when the LLM-driven cell-context pass has been
+    disabled). In that case the cell's slot in ``contexts`` and
+    ``evidence`` is simply omitted; the rest of the bundle (visuals,
+    lineage) is assembled normally so the framework stays usable as a
+    structural manifest.
+
     z15_same_center_path is expected to be the context image that was
     already fetched during grid scoring at the z16 cell. Pass None if that
     image is not available; the bundle will simply omit Z15_SAME_CENTER.
@@ -543,10 +550,9 @@ def assemble_z16_bundle(
     structures_dir.mkdir(parents=True, exist_ok=True)
 
     full_lineage: list[LineageRef] = [*ancestor_lineage, self_lineage]
-    contexts: dict[str, CellContext] = {
-        **ancestor_contexts,
-        cell_id: self_context,
-    }
+    contexts: dict[str, CellContext] = dict(ancestor_contexts)
+    if self_context is not None:
+        contexts[cell_id] = self_context
     evidence: dict[str, list[EvidenceSummary]] = {
         ref.cell_id: contexts[ref.cell_id].evidence
         for ref in full_lineage
