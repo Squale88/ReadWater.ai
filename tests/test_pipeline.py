@@ -40,7 +40,8 @@ def registry():
 
 
 def _placeholder_dual_pass_result():
-    """Default dual-pass grid result: all cells score 5 (confident keep)."""
+    """Legacy LLM dual-pass placeholder (kept for backward reference; no longer
+    patched into cell_analyzer because the LLM scoring is gone)."""
     return {
         "summary": "Placeholder dual-pass analysis",
         "sub_scores": [
@@ -55,33 +56,53 @@ def _placeholder_dual_pass_result():
 
 
 def _placeholder_confirm_result():
-    """Default confirmation result: always confirms fishing water."""
+    """Legacy LLM confirm placeholder (kept for backward reference; no longer
+    patched in because the ambiguous-score path no longer exists)."""
     return {"has_fishing_water": True, "reasoning": "Placeholder", "raw_response": ""}
+
+
+def _placeholder_cv_analysis(sub_cells_map: dict | None = None,
+                             keep_cells: set[int] | None = None):
+    """CellAnalysis matching what _score_subcells_via_cv_rubric returns.
+
+    By default keeps all 16 sub-cells (score 5.0). Pass keep_cells={1,2,3} to
+    mark only those cell numbers (1-indexed, row-major) as kept.
+    """
+    from readwater.models.cell import CellAnalysis, CellScore
+    keep = keep_cells if keep_cells is not None else set(range(1, 17))
+    sub_scores = []
+    for r in range(4):
+        for c in range(4):
+            cell_n = r * 4 + c + 1
+            score = 5.0 if cell_n in keep else 0.0
+            center = (sub_cells_map or {}).get((r, c), (25.94, -81.73))
+            sub_scores.append(CellScore(
+                row=r, col=c, score=score,
+                summary=f"mock cv-rubric (keep={cell_n in keep})",
+                center=center,
+            ))
+    return CellAnalysis(
+        overall_summary=f"mock CV rubric: {len(keep)}/16 sub-cells kept",
+        sub_scores=sub_scores,
+        hydrology_notes="",
+        model_used="cv-rubric-v1",
+    )
 
 
 @pytest.fixture
 def fast_registry(registry):
-    """Registry with asyncio.sleep and Claude vision mocked out."""
+    """Registry with asyncio.sleep and CV-rubric scoring mocked out."""
     with (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
         patch(
-            "readwater.pipeline.cell_analyzer.dual_pass_grid_scoring",
-            new_callable=AsyncMock,
-            return_value=_placeholder_dual_pass_result(),
+            "readwater.pipeline.cell_analyzer._score_subcells_via_cv_rubric",
+            side_effect=lambda bbox, parent_zoom, sub_cells_map, output_dir:
+                _placeholder_cv_analysis(sub_cells_map),
         ),
         patch(
             "readwater.pipeline.cell_analyzer.run_cell_full",
             new_callable=MagicMock,
             return_value=_placeholder_cell_result(),
-        ),
-        patch(
-            "readwater.pipeline.cell_analyzer.confirm_fishing_water",
-            new_callable=AsyncMock,
-            return_value=_placeholder_confirm_result(),
-        ),
-        patch(
-            "readwater.pipeline.cell_analyzer.draw_grid_overlay",
-            side_effect=lambda p, **kw: p,
         ),
     ):
         yield registry
@@ -317,13 +338,15 @@ async def test_image_filenames_follow_convention(fast_registry, tmp_path):
 
 
 def _vision_patches():
-    """Context manager that mocks all vision calls + sleep for non-dry-run tests."""
+    """Context manager that mocks CV-rubric scoring + sleep for non-dry-run tests."""
     return (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
-        patch("readwater.pipeline.cell_analyzer.dual_pass_grid_scoring", new_callable=AsyncMock, return_value=_placeholder_dual_pass_result()),
+        patch(
+            "readwater.pipeline.cell_analyzer._score_subcells_via_cv_rubric",
+            side_effect=lambda bbox, parent_zoom, sub_cells_map, output_dir:
+                _placeholder_cv_analysis(sub_cells_map),
+        ),
         patch("readwater.pipeline.cell_analyzer.run_cell_full", new_callable=MagicMock, return_value=_placeholder_cell_result()),
-        patch("readwater.pipeline.cell_analyzer.confirm_fishing_water", new_callable=AsyncMock, return_value=_placeholder_confirm_result()),
-        patch("readwater.pipeline.cell_analyzer.draw_grid_overlay", side_effect=lambda p, **kw: p),
     )
 
 
@@ -335,7 +358,7 @@ async def test_structure_zoom_multi_provider(tmp_path):
     reg.register(p1, ["overview", "structure"])
     reg.register(p2, ["structure"])
 
-    with _vision_patches()[0], _vision_patches()[1], _vision_patches()[2], _vision_patches()[3], _vision_patches()[4]:
+    with _vision_patches()[0], _vision_patches()[1], _vision_patches()[2]:
         cells = await analyze_cell(
             MARCO, reg, start_zoom=12, max_depth=2, max_api_calls=21,
             output_dir=str(tmp_path),
@@ -357,7 +380,7 @@ async def test_structure_filenames_have_provider_suffix(tmp_path):
     reg.register(p1, ["overview", "structure"])
     reg.register(p2, ["structure"])
 
-    with _vision_patches()[0], _vision_patches()[1], _vision_patches()[2], _vision_patches()[3], _vision_patches()[4]:
+    with _vision_patches()[0], _vision_patches()[1], _vision_patches()[2]:
         cells = await analyze_cell(
             MARCO, reg, start_zoom=12, max_depth=2, max_api_calls=21,
             output_dir=str(tmp_path),
@@ -372,22 +395,29 @@ async def test_structure_filenames_have_provider_suffix(tmp_path):
 
 
 async def test_structure_api_calls_count_per_provider(tmp_path):
-    """2 providers at structure level means 2 API calls per cell + 1 zoom-15 context fetch."""
+    """2 providers at structure level means 2 API calls per cell.
+
+    Z15 context-fetch was removed alongside the LLM-driven scoring (no
+    consumer needs the context image now). So each z16 cell incurs
+    exactly 2 fetches (one per registered structure-role provider).
+    """
     p1 = PlaceholderProvider(provider_name="a")
     p2 = PlaceholderProvider(provider_name="b")
     reg = ImageProviderRegistry()
     reg.register(p1, ["overview", "structure"])
     reg.register(p2, ["structure"])
 
-    # Budget: root(1) + 1 depth-1(1) + 2 depth-2 cells at (2 providers + 1 z15 ctx) = 1 + 1 + 2*3 = 8.
-    with _vision_patches()[0], _vision_patches()[1], _vision_patches()[2], _vision_patches()[3], _vision_patches()[4]:
+    # Budget: root(1) + 1 depth-1(1) + 3 depth-2 cells at 2 providers each
+    # = 1 + 1 + 3*2 = 8.  (With the legacy +1 z15 ctx per z16 cell, this
+    # was 1 + 1 + 2*3 = 8 producing 2 structure cells; now it's 3.)
+    with _vision_patches()[0], _vision_patches()[1], _vision_patches()[2]:
         cells = await analyze_cell(
             MARCO, reg, start_zoom=12, max_depth=2, max_api_calls=8,
             output_dir=str(tmp_path),
         )
 
     structure_cells = [c for c in cells if c.zoom_level == 16 and len(c.provider_images) == 2]
-    assert len(structure_cells) == 2
+    assert len(structure_cells) == 3
 
 
 async def test_overview_single_provider_no_suffix(fast_registry, tmp_path):
@@ -471,19 +501,24 @@ def _mock_dual_pass_result(high_cells=(1, 2, 3, 4)):
 
 
 async def test_vision_pruning_only_high_cells_recurse(tmp_path):
-    """Mock Claude to score cells 1-4 high (8.0) and 5-16 low (1.0).
+    """Mock CV-rubric to keep cells 1-4 (score 5.0) and drop 5-16 (score 0.0).
     With threshold=4.0, only cells 1-4 should recurse into children.
     Cells 1-4 map to row 0 (r0c0, r0c1, r0c2, r0c3)."""
     reg = ImageProviderRegistry()
     reg.register(PlaceholderProvider(), ["overview", "structure"])
 
-    mock_result = _mock_dual_pass_result(high_cells=(1, 2, 3, 4))
-
     with (
         patch("readwater.pipeline.cell_analyzer.asyncio.sleep", new_callable=AsyncMock),
-        patch("readwater.pipeline.cell_analyzer.dual_pass_grid_scoring", new_callable=AsyncMock, return_value=mock_result),
-        patch("readwater.pipeline.cell_analyzer.confirm_fishing_water", new_callable=AsyncMock, return_value=_placeholder_confirm_result()),
-        patch("readwater.pipeline.cell_analyzer.draw_grid_overlay", side_effect=lambda p, **kw: p),
+        patch(
+            "readwater.pipeline.cell_analyzer._score_subcells_via_cv_rubric",
+            side_effect=lambda bbox, parent_zoom, sub_cells_map, output_dir:
+                _placeholder_cv_analysis(sub_cells_map, keep_cells={1, 2, 3, 4}),
+        ),
+        patch(
+            "readwater.pipeline.cell_analyzer.run_cell_full",
+            new_callable=MagicMock,
+            return_value=_placeholder_cell_result(),
+        ),
     ):
         cells = await analyze_cell(
             MARCO, reg, start_zoom=10, max_depth=1,
